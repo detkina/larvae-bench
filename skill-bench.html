@@ -95,6 +95,8 @@ function makeBody(posture, rnd) {
   const BEND = JOINT.BEND * DEG;
   const b = {
     posture, label: P.label, legs: P.legs,
+    // roll about the long axis: 0 = on the left side, 90° = on the back, 180° = on the right side
+    rho: (posture === 'left' ? 0 : posture === 'back' ? 90 : 180) * DEG,
     x: 0, y: 0, psi: 0,      // the tail–middle joint, and the heading of the middle
     beta: 0,                 // tail–middle bend in the floor plane, + = tail to the right
     lam: 0,                  // tail lift off the floor
@@ -246,8 +248,8 @@ const SKILLS = [
   { value: 'crawl-left',  label: 'Crawl to target on the left side',  posture: 'left' },
   { value: 'crawl-right', label: 'Crawl to target on the right side', posture: 'right' },
   { value: 'crawl-back',  label: 'Crawl to target on the back',       posture: 'back' },
-  { value: 'roll-lr', label: 'Roll left → right over the back (next)', disabled: true },
-  { value: 'roll-rl', label: 'Roll right → left over the back (next)', disabled: true },
+  { value: 'roll-lr', label: 'Roll from the left side to the right, over the back', kind: 'roll', from: 'left', to: 'right' },
+  { value: 'roll-rl', label: 'Roll from the right side to the left, over the back', kind: 'roll', from: 'right', to: 'left' },
   { value: 'ring-l',  label: 'Curl on the left side, crawl round, push aside (next)', disabled: true },
   { value: 'ring-r',  label: 'Curl on the right side, crawl round, push aside (next)', disabled: true },
   { value: 'tail-l',  label: 'On the left side: tail toward legs / back / up (next)', disabled: true },
@@ -265,6 +267,7 @@ const SCHEMA = [
 const SkillBench = {
   create(params, rng) {
     const skill = SKILLS.find(s => s.value === params.skill);
+    if (skill.kind === 'roll') return createRoll(skill, rng);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -388,6 +391,85 @@ const SkillBench = {
   drawEmpty(ctx, W, H) { drawFloor(ctx, W, H); }
 };
 
+
+/* ---------------- ROLL over the back ----------------
+   As described: lying on a side, curled toward the legs; it straightens out,
+   holding the tail up a little so the tail does not push it; rolls onto the
+   back, then onto the other side; holds the tail up a little again and curls
+   up like a shrimp. On the spot: nothing pushes, so nothing moves. */
+const ROLL = {
+  CURL: 110,       // curled pose toward the legs, deg (the hook in the drawing)
+  TAIL_UP: 10,     // tail held up a little while straightening and curling, deg
+  HOLD: 1.0, STRAIGHTEN: 1.0, ROLL: 2.0, CURL_S: 1.0   // s
+};
+
+function createRoll(skill, rng) {
+  const rL = rng('larva');
+  const body = makeBody(skill.from, rL);
+  body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+  body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+  body.psi = rL.range(-Math.PI, Math.PI);
+  const legsFrom = POSTURES[skill.from].legs, legsTo = POSTURES[skill.to].legs;
+  const rho0 = body.rho, rho1 = (skill.to === 'left' ? 0 : 180) * DEG;
+  const C = ROLL.CURL * DEG, U = ROLL.TAIL_UP * DEG;
+  body.beta = legsFrom * C;
+  const t1 = ROLL.HOLD, t2 = t1 + ROLL.STRAIGHTEN, t3 = t2 + ROLL.ROLL, t4 = t3 + ROLL.CURL_S, t5 = t4 + ROLL.HOLD;
+  const start = { x: body.x, y: body.y };
+  let t = 0, phase = 'curled';
+  const bump = g => Math.sin(Math.PI * clamp(g, 0, 1));   // up and back down
+
+  function pose() {
+    if (t < t1) { phase = 'curled'; body.beta = legsFrom * C; body.lam = 0; }
+    else if (t < t2) { const g = (t - t1) / ROLL.STRAIGHTEN; phase = 'straighten'; body.beta = legsFrom * C * (1 - smooth(g)); body.lam = U * bump(g); }
+    else if (t < t3) { const g = (t - t2) / ROLL.ROLL; phase = g < 0.5 ? 'to-back' : 'to-side'; body.beta = 0; body.lam = 0; body.rho = rho0 + (rho1 - rho0) * smooth(g); }
+    else if (t < t4) { const g = (t - t3) / ROLL.CURL_S; phase = 'curl'; body.rho = rho1; body.beta = legsTo * C * smooth(g); body.lam = U * bump(g); }
+    else { phase = 'done'; body.rho = rho1; body.beta = legsTo * C; body.lam = 0; }
+    const c = Math.cos(body.rho);
+    body.legs = Math.abs(c) > 0.7 ? Math.sign(c) : 0;
+    body.label = Math.abs(c) > 0.7 ? (c > 0 ? 'left side' : 'right side') : 'back';
+    body.delta = 0;
+  }
+  pose();
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; pose(); },
+    status() {
+      const deg = Math.round(body.rho / DEG);
+      const from = POSTURES[skill.from].label, to = POSTURES[skill.to].label;
+      const detail = 'rolled ' + Math.abs(Math.round((body.rho - rho0) / DEG)) + '° of 180° · tail bent ' +
+        Math.abs(Math.round(body.beta / DEG)) + '°, lifted ' + Math.round(body.lam / DEG) + '°';
+      switch (phase) {
+        case 'curled': return { action: 'CURLED ON THE ' + from.toUpperCase(), reason: 'lying curled toward the legs', detail };
+        case 'straighten': return { action: 'STRAIGHTENING', reason: 'tail held up a little so it does not push', detail };
+        case 'to-back': return { action: 'ROLLING ONTO THE BACK', reason: 'turning over through the back, on the spot', detail };
+        case 'to-side': return { action: 'ROLLING ONTO THE ' + to.toUpperCase(), reason: 'coming down on the other side', detail };
+        case 'curl': return { action: 'CURLING UP', reason: 'tail held up a little so it does not push', detail };
+      }
+      return { action: 'CURLED ON THE ' + to.toUpperCase(), reason: 'turned over and curled up like a shrimp', detail };
+    },
+    done() { return t >= t5 ? { ok: true, why: 'rolled over through the back, on the spot' } : null; },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5),
+        delta: 0, rho: +body.rho.toFixed(5), head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) },
+        tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) }, phase, pushing: false, skipChecks: false };
+    },
+    invariants: [
+      { name: 'joints', check: (a, b) => Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG ? 'tail–middle bent past ' + JOINT.BEND + '°' : null },
+      { name: 'over the back', check: (a, b) => Math.sin(b.rho) < -1e-6 ? 'rolled through the belly' : null },
+      { name: 'on the spot', check: (a, b) => {
+        const d = Math.hypot(b.x - start.x, b.y - start.y);
+        return d > 0.01 ? 'body moved ' + (d * 10).toFixed(1) + ' mm along the floor' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
+        return d > 0.05 ? 'head moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
+  };
+}
+
 /* ---------------- drawing: lines on white ---------------- */
 function X(x) { return x * PX; }
 function Y(y) { return (ARENA.H - y) * PX; }
@@ -420,10 +502,12 @@ function drawScene(ctx, W, H, body, target, trail) {
     ctx.stroke();
   }
   ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.arc(X(target.x), Y(target.y), TARGET_R * PX, 0, 2 * Math.PI); ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(X(target.x) - 5, Y(target.y)); ctx.lineTo(X(target.x) + 5, Y(target.y));
-  ctx.moveTo(X(target.x), Y(target.y) - 5); ctx.lineTo(X(target.x), Y(target.y) + 5); ctx.stroke();
+  if (target) {
+    ctx.beginPath(); ctx.arc(X(target.x), Y(target.y), TARGET_R * PX, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(X(target.x) - 5, Y(target.y)); ctx.lineTo(X(target.x) + 5, Y(target.y));
+    ctx.moveTo(X(target.x), Y(target.y) - 5); ctx.lineTo(X(target.x), Y(target.y) + 5); ctx.stroke();
+  }
 
   const p = body.points();
   ctx.strokeStyle = '#000'; ctx.lineWidth = 1.3;
@@ -431,20 +515,21 @@ function drawScene(ctx, W, H, body, target, trail) {
   capsule(ctx, p.TM, p.MH, BODY.MID_D / 2, false);
   ctx.beginPath(); ctx.arc(X(p.head.x), Y(p.head.y), BODY.HEAD_D / 2 * PX, 0, 2 * Math.PI); ctx.stroke();
 
-  // legs: three ticks on the side they face; three dots when they face up
+  // legs: ticks on the side they face, as long as they reach out sideways;
+  // dots when they face up (on the back, or midway through a roll)
   const u = body.u(), rr = { x: u.y, y: -u.x };
+  const side = Math.cos(body.rho), up = Math.sin(body.rho);
   ctx.fillStyle = '#000';
   for (let i = 1; i <= 3; i++) {
     const t = i / 4, c = { x: p.TM.x + u.x * BODY.MID_LEN * t, y: p.TM.y + u.y * BODY.MID_LEN * t };
-    if (body.legs !== 0) {
-      const s = body.legs, r0 = BODY.MID_D / 2, r1 = r0 + 0.14;
+    if (Math.abs(side) > 0.2) {
+      const s = Math.sign(side), r0 = BODY.MID_D / 2 * Math.abs(side), r1 = r0 + 0.14 * Math.abs(side);
       ctx.beginPath();
       ctx.moveTo(X(c.x + rr.x * s * r0), Y(c.y + rr.y * s * r0));
       ctx.lineTo(X(c.x + rr.x * s * r1), Y(c.y + rr.y * s * r1));
       ctx.stroke();
-    } else {
-      ctx.beginPath(); ctx.arc(X(c.x), Y(c.y), 1.6, 0, 2 * Math.PI); ctx.fill();
     }
+    if (up > 0.5) { ctx.beginPath(); ctx.arc(X(c.x + rr.x * side * 0.1), Y(c.y + rr.y * side * 0.1), 1.6, 0, 2 * Math.PI); ctx.fill(); }
   }
   drawSideView(ctx, W, H, body);
 }
@@ -476,6 +561,18 @@ function drawSideView(ctx, W, H, body) {
   ctx.beginPath(); ctx.arc(sx(hx), sy(hz), hr * K, 0, 2 * Math.PI); ctx.stroke();
   ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
   ctx.fillText('side view · tail lift ' + (body.lam / DEG).toFixed(0) + '°', x0 + 6, y0 + 12);
+  // the body seen end-on from behind, in its own box: which way the legs point
+  const bx0 = x0, by0 = y0 + bh + 6, bs = 84;
+  ctx.fillStyle = '#fff'; ctx.fillRect(bx0, by0, bs, bs);
+  ctx.strokeRect(bx0 + 0.5, by0 + 0.5, bs - 1, bs - 1);
+  const ef = by0 + bs - 14, er = BODY.MID_D / 2 * K, ex = bx0 + bs / 2, ey = ef - er;
+  ctx.beginPath(); ctx.moveTo(bx0 + 6, ef); ctx.lineTo(bx0 + bs - 6, ef); ctx.stroke();
+  ctx.beginPath(); ctx.arc(ex, ey, er, 0, 2 * Math.PI); ctx.stroke();
+  const lx = Math.cos(body.rho), lz = Math.sin(body.rho);
+  ctx.beginPath(); ctx.moveTo(ex + lx * er, ey - lz * er); ctx.lineTo(ex + lx * (er + 9), ey - lz * (er + 9)); ctx.stroke();
+  ctx.fillStyle = '#000';
+  ctx.fillText('from behind', bx0 + 6, by0 + 12);
+  ctx.fillText('legs', ex + lx * (er + 12) - 9, ey - lz * (er + 12) + 3);
 }
 
 /* ---------------- the page ---------------- */
@@ -502,6 +599,7 @@ if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
         ['stroke', GAIT.STROKE_S + ' s, ' + GAIT.STEP * 10 + ' mm, tail lifted ' + GAIT.LIFT + '° while it swings'],
         ['tail on a side', 'curled toward the legs every stroke, ' + GAIT.SWEEP_SIDE + '°'],
         ['tail on the back', 'bent to one side ' + GAIT.SWEEP_BACK + '°, pushes on the floor down to ' + GAIT.BACK_MIN + '°, lifts, bends again; ' + GAIT.BOUT_MIN + '–' + GAIT.BOUT_MAX + ' strokes one side, then the other (video)'],
+        ['roll over the back', 'curled ' + ROLL.CURL + '° toward the legs → straightens, tail up ' + ROLL.TAIL_UP + '° → back → other side → curls up, tail up ' + ROLL.TAIL_UP + '°; ' + (ROLL.STRAIGHTEN + ROLL.ROLL + ROLL.CURL_S) + ' s, on the spot'],
         ['head on the back', 'bends to the tail\'s side by ' + Math.round(GAIT.BACK_C * 100) + '% of the tail\'s bend: the body is a C'],
         ['turning on the back', 'head within ±' + GAIT.HEAD_STEER + '° of the body axis; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s'],
         ['head', 'held up ' + GAIT.HEAD_LIFT + '° off the ground, sweeping ±' + GAIT.SCAN + '° once a stroke']
