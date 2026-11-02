@@ -65,7 +65,13 @@ const GAIT = {
   STROKE_S: 2.0,       // one tail stroke, seconds
   STEP: 0.24,          // ground gained per stroke, cm
   SWEEP_SIDE: 75,      // on a side: tail curled toward the legs, every stroke, deg (measured)
-  SWEEP_BACK: 45,      // on the back: tail curled to one side, then the other, less far, deg
+  // On the back (from the video, 39–59 s, measured at 10 frames a second): the
+  // body bends like a C to one side and pumps there between about 20° and 45°
+  // once a stroke, for about four strokes, then goes over to the other side.
+  SWEEP_BACK: 35,      // tail–middle bend at the start of a push, deg
+  BACK_MIN: 15,        // ...and at its end: the tail does not straighten fully, deg
+  BACK_C: 0.3,         // the head bends to the same side as the tail, by this share
+  BOUT_MIN: 3, BOUT_MAX: 5,   // strokes to one side before going over to the other
   LIFT: 20,            // tail lift while it swings, deg
   HEAD_LIFT: 30,       // the head is held up off the ground, never laid on it, deg
   SCAN: 12,            // the head keeps sweeping side to side, ± deg, once a stroke
@@ -94,7 +100,7 @@ function makeBody(posture, rnd) {
     lam: 0,                  // tail lift off the floor
     delta: 0,                // middle–head bend in the floor plane, + = head to the right
     tempo: 1 + rnd.range(-GAIT.TEMPO_SPREAD, GAIT.TEMPO_SPREAD),
-    nextSign: rnd.sign(), scanPhase: rnd.range(0, 2 * Math.PI),
+    nextSign: rnd.sign(), scanPhase: rnd.range(0, 2 * Math.PI), bout: 0, rndBout: rnd,
     headLift: GAIT.HEAD_LIFT * DEG,
     inStroke: false, f: 0, sign: 1, betaS: 0, betaE: 0, lamE: 0, pushed: 0,
     recoverStarted: false, halted: false, pushing: false, phase: 'still', travelled: 0,
@@ -138,7 +144,9 @@ function makeBody(posture, rnd) {
     // on the back the head stays almost on the body axis; on a side it turns to the target
     const steerMax = P.legs === 0 ? GAIT.HEAD_STEER * DEG : BEND;
     const steer = clamp(cmd.aim || 0, -steerMax, steerMax);
-    const want = clamp(steer + scan, -BEND, BEND);
+    // on the back the whole body is a C: the head follows the tail's side
+    const cBend = P.legs === 0 ? GAIT.BACK_C * b.beta : 0;
+    const want = clamp(steer + scan + cBend, -BEND, BEND);
     const rate = GAIT.HEAD_RATE * DEG * dt;
     b.delta += clamp(wrap(want - b.delta), -rate, rate);
 
@@ -156,7 +164,13 @@ function makeBody(posture, rnd) {
       b.inStroke = true; b.f = 0; b.pushed = 0; b.halted = false;
       // on a side the tail always curls toward the legs; on the back it alternates
       if (P.legs !== 0) b.sign = P.legs;
-      else { b.sign = b.nextSign; b.nextSign = -b.nextSign; }
+      else {
+        if (b.bout <= 0) {
+          b.sign = b.nextSign; b.nextSign = -b.nextSign;
+          b.bout = GAIT.BOUT_MIN + Math.floor(b.rndBout.next() * (GAIT.BOUT_MAX - GAIT.BOUT_MIN + 1));
+        }
+        b.bout--;
+      }
       b.betaS = b.beta; b.lamS = b.lam;
     }
     // told to stop mid-stroke: the front stays where it is, the tail straightens
@@ -193,13 +207,15 @@ function makeBody(posture, rnd) {
     } else {                                            // push: straightening on the floor
       b.lam = 0;
       const g = clamp((f - 0.45) / 0.50, 0, 1);
-      b.beta = target * (1 - smooth(g));
+      const end = P.legs !== 0 ? 0 : b.sign * GAIT.BACK_MIN * DEG;
+      b.beta = target + (end - target) * smooth(g);
       const D = GAIT.STEP * (g - Math.sin(2 * Math.PI * g) / (2 * Math.PI));
       if (D > b.pushed) { slideFront(D - b.pushed); b.pushed = D; }
       b.phase = g < 1 ? 'push' : 'rest';
       b.pushing = g < 1;
     }
-    if (f >= 1) { b.beta = 0; b.lam = 0; b.inStroke = false; b.phase = 'rest'; }
+    // the stroke ends where the push left the tail: straight on a side, still bent on the back
+    if (f >= 1) { if (P.legs !== 0) b.beta = 0; b.lam = 0; b.inStroke = false; b.phase = 'rest'; }
   };
 
   // words for a floor side (+1 = right of the heading), in the body's own terms
@@ -485,7 +501,8 @@ if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
         ['both joints, twist', JOINT.TWIST + '° — front twisted under; rolling over the back'],
         ['stroke', GAIT.STROKE_S + ' s, ' + GAIT.STEP * 10 + ' mm, tail lifted ' + GAIT.LIFT + '° while it swings'],
         ['tail on a side', 'curled toward the legs every stroke, ' + GAIT.SWEEP_SIDE + '°'],
-        ['tail on the back', 'pushes off left, lifts, pushes off right, lifts — ' + GAIT.SWEEP_BACK + '° to each side; touches the floor only to push'],
+        ['tail on the back', 'bent to one side ' + GAIT.SWEEP_BACK + '°, pushes on the floor down to ' + GAIT.BACK_MIN + '°, lifts, bends again; ' + GAIT.BOUT_MIN + '–' + GAIT.BOUT_MAX + ' strokes one side, then the other (video)'],
+        ['head on the back', 'bends to the tail\'s side by ' + Math.round(GAIT.BACK_C * 100) + '% of the tail\'s bend: the body is a C'],
         ['turning on the back', 'head within ±' + GAIT.HEAD_STEER + '° of the body axis; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s'],
         ['head', 'held up ' + GAIT.HEAD_LIFT + '° off the ground, sweeping ±' + GAIT.SCAN + '° once a stroke']
       ];
