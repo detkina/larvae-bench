@@ -261,13 +261,15 @@ const SKILLS = [
 const SCHEMA = [
   { key: 'skill', label: 'Skill', type: 'select', value: 'crawl-left', options: SKILLS },
   { key: 'distance', label: 'Target distance', type: 'number', min: 3, max: 12, step: 0.5, value: 8, unit: 'cm',
-    hint: 'Where the target starts, in any direction, behind included. Click the floor to move it.' }
+    hint: 'Where the target starts, in any direction, behind included. Click the floor to move it.' },
+  { key: 'curl', label: 'Roll: starting curl', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
+    hint: 'How far the tail is bent toward the legs before the roll. Any bend works: it straightens out first.' }
 ];
 
 const SkillBench = {
   create(params, rng) {
     const skill = SKILLS.find(s => s.value === params.skill);
-    if (skill.kind === 'roll') return createRoll(skill, rng);
+    if (skill.kind === 'roll') return createRoll(skill, rng, params.curl);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -403,7 +405,7 @@ const ROLL = {
   HOLD: 1.0, STRAIGHTEN: 1.0, ROLL: 2.0, CURL_S: 1.0   // s
 };
 
-function createRoll(skill, rng) {
+function createRoll(skill, rng, startCurl) {
   const rL = rng('larva');
   const body = makeBody(skill.from, rL);
   body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -412,15 +414,16 @@ function createRoll(skill, rng) {
   const legsFrom = POSTURES[skill.from].legs, legsTo = POSTURES[skill.to].legs;
   const rho0 = body.rho, rho1 = (skill.to === 'left' ? 0 : 180) * DEG;
   const C = ROLL.CURL * DEG, U = ROLL.TAIL_UP * DEG;
-  body.beta = legsFrom * C;
+  const C0 = (startCurl === undefined ? ROLL.CURL : startCurl) * DEG;
+  body.beta = legsFrom * C0;
   const t1 = ROLL.HOLD, t2 = t1 + ROLL.STRAIGHTEN, t3 = t2 + ROLL.ROLL, t4 = t3 + ROLL.CURL_S, t5 = t4 + ROLL.HOLD;
   const start = { x: body.x, y: body.y };
   let t = 0, phase = 'curled';
   const bump = g => Math.sin(Math.PI * clamp(g, 0, 1));   // up and back down
 
   function pose() {
-    if (t < t1) { phase = 'curled'; body.beta = legsFrom * C; body.lam = 0; }
-    else if (t < t2) { const g = (t - t1) / ROLL.STRAIGHTEN; phase = 'straighten'; body.beta = legsFrom * C * (1 - smooth(g)); body.lam = U * bump(g); }
+    if (t < t1) { phase = 'curled'; body.beta = legsFrom * C0; body.lam = 0; }
+    else if (t < t2) { const g = (t - t1) / ROLL.STRAIGHTEN; phase = 'straighten'; body.beta = legsFrom * C0 * (1 - smooth(g)); body.lam = U * bump(g); }
     else if (t < t3) { const g = (t - t2) / ROLL.ROLL; phase = g < 0.5 ? 'to-back' : 'to-side'; body.beta = 0; body.lam = 0; body.rho = rho0 + (rho1 - rho0) * smooth(g); }
     else if (t < t4) { const g = (t - t3) / ROLL.CURL_S; phase = 'curl'; body.rho = rho1; body.beta = legsTo * C * smooth(g); body.lam = U * bump(g); }
     else { phase = 'done'; body.rho = rho1; body.beta = legsTo * C; body.lam = 0; }
