@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light only">
+<title>LARVAE — skill bench</title>
+<style>
+  :root { color-scheme: light; }
+  /* forced dark mode repaints background-color, not background-image;
+     -webkit-text-fill-color survives its text pass */
+  html, body {
+    margin: 0; padding: 0;
+    background-color: #fff; background-image: linear-gradient(#fff, #fff);
+    color: #000; -webkit-text-fill-color: #000;
+    font-family: Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.45;
+    -webkit-text-size-adjust: 100%;
+  }
+  div, span, label, p, td, th, h1, h2 { -webkit-text-fill-color: inherit; }
+  .bench-table { border-collapse: collapse; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; }
+  .bench-table td, .bench-table th { border-bottom: 1px solid #ddd; padding: 2px 10px 2px 0; text-align: left; }
+  .bench-table th { font-weight: bold; border-bottom: 1px solid #000; }
+  details summary { cursor: pointer; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+</style>
+<script src="harness.js"></script>
+</head>
+<body>
+<div id="bench-host"></div>
+
+<script>
+/* ============================================================
+   SKILL BENCH — one larva, one body skill at a time, pure geometry.
+   No forces, no senses, no behaviour rules: the observer sets the
+   target, the body shows whether it can do the skill.
+   Units: centimetres and seconds; the world's y axis points up.
+   ============================================================ */
+
+const DEG = Math.PI / 180;
+const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const smooth = x => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); };
+
+/* ---------------- BODY: three sausages ----------------
+   tail and middle soft, head hard. The legs (three pairs, on the
+   middle) and the jaws are not drawn. The joints are under a sleeve,
+   so nothing can get caught in them. */
+const BODY = {
+  TAIL_LEN: 1.5,  TAIL_D: 0.7,   // tail, 0.49 g
+  MID_LEN: 1.0,   MID_D: 0.6,    // middle with the legs, 0.23 g
+  HEAD_D: 0.5,                   // head, 0.07 g
+  ANCHOR: 0.75                   // the tail bears on the ground at its centre
+};
+
+/* ---------------- BODY: joints ----------------
+   Both joints are the same and bend the same way in every direction.
+   The one number is the least that allows every pose on the list:
+   the hook (drawing: tail folded about 110° to the middle). */
+const JOINT = {
+  BEND: 120,    // deg, any direction: toward the legs, the back, either side, up
+  TWIST: 90     // deg: fore-body twisted under itself legs first; rolling over the back
+};
+
+/* ---------------- BODY: gait (measured from video) ---------------- */
+const GAIT = {
+  STROKE_S: 2.0,       // one tail stroke, seconds
+  STEP: 0.24,          // ground gained per stroke, cm
+  SWEEP_SIDE: 75,      // on a side: tail curled toward the legs, every stroke, deg (measured)
+  SWEEP_BACK: 45,      // on the back: tail curled to one side, then the other, less far, deg
+  LIFT: 20,            // tail lift while it swings, deg
+  HEAD_LIFT: 30,       // the head is held up off the ground, never laid on it, deg
+  SCAN: 12,            // the head keeps sweeping side to side, ± deg, once a stroke
+  HEAD_STEER: 15,      // on the back: the head stays almost on the body axis, deg
+  FRONT_SWING: 30,     // on the back: between pushes the front swings round at most this fast, deg/s
+  TEMPO_SPREAD: 0.15,  // individual tempo ±15 %
+  HEAD_RATE: 40        // the head turns smoothly, at most this fast, deg/s
+};
+
+// Which way the legs face, as seen from above: +1 = right of the heading,
+// -1 = left, 0 = up (lying on the back). This changes only what is drawn
+// and the words used; the joints are the same whichever side is down.
+const POSTURES = {
+  left:  { label: 'left side',  legs: +1 },
+  right: { label: 'right side', legs: -1 },
+  back:  { label: 'back',       legs: 0 }
+};
+
+function makeBody(posture, rnd) {
+  const P = POSTURES[posture];
+  const BEND = JOINT.BEND * DEG;
+  const b = {
+    posture, label: P.label, legs: P.legs,
+    x: 0, y: 0, psi: 0,      // the tail–middle joint, and the heading of the middle
+    beta: 0,                 // tail–middle bend in the floor plane, + = tail to the right
+    lam: 0,                  // tail lift off the floor
+    delta: 0,                // middle–head bend in the floor plane, + = head to the right
+    tempo: 1 + rnd.range(-GAIT.TEMPO_SPREAD, GAIT.TEMPO_SPREAD),
+    nextSign: rnd.sign(), scanPhase: rnd.range(0, 2 * Math.PI),
+    headLift: GAIT.HEAD_LIFT * DEG,
+    inStroke: false, f: 0, sign: 1, betaS: 0, betaE: 0, lamE: 0, pushed: 0,
+    recoverStarted: false, halted: false, pushing: false, phase: 'still', travelled: 0,
+    BEND
+  };
+
+  b.u = () => ({ x: Math.cos(b.psi), y: Math.sin(b.psi) });
+  b.tailDir = () => ({ x: Math.cos(b.psi + Math.PI + b.beta), y: Math.sin(b.psi + Math.PI + b.beta) });
+  b.headDir = () => ({ x: Math.cos(b.psi - b.delta), y: Math.sin(b.psi - b.delta) });
+  b.points = () => {
+    const u = b.u(), d = b.tailDir(), h = b.headDir(), c = Math.cos(b.lam);
+    const MH = { x: b.x + u.x * BODY.MID_LEN, y: b.y + u.y * BODY.MID_LEN };
+    return {
+      TM: { x: b.x, y: b.y }, MH,
+      // the head is tilted up, so seen from above it sits a little closer
+      head: { x: MH.x + h.x * BODY.HEAD_D / 2 * Math.cos(b.headLift), y: MH.y + h.y * BODY.HEAD_D / 2 * Math.cos(b.headLift) },
+      tailC: { x: b.x + d.x * BODY.ANCHOR * c, y: b.y + d.y * BODY.ANCHOR * c },
+      tailEnd: { x: b.x + d.x * BODY.TAIL_LEN * c, y: b.y + d.y * BODY.TAIL_LEN * c }
+    };
+  };
+
+  // Ground law. The head leads: the front end goes where the head points.
+  // The middle is drawn after it and cannot slide sideways. The tail
+  // bears on the ground at its centre and can slide only along itself.
+  function slide(ds) {
+    const d0 = b.tailDir();
+    const C0 = { x: b.x + d0.x * BODY.ANCHOR, y: b.y + d0.y * BODY.ANCHOR };
+    const u = b.u(), h = b.headDir();
+    const MH = { x: b.x + u.x * BODY.MID_LEN + h.x * ds, y: b.y + u.y * BODY.MID_LEN + h.y * ds };
+    const headAngle = b.psi - b.delta;
+    // the middle follows the front end like a towed bar
+    const vx = MH.x - b.x, vy = MH.y - b.y, L = Math.hypot(vx, vy);
+    b.x = MH.x - vx / L * BODY.MID_LEN; b.y = MH.y - vy / L * BODY.MID_LEN;
+    b.psi = Math.atan2(vy, vx);
+    b.delta = wrap(b.psi - headAngle);        // the head keeps pointing where it pointed
+    // the tail centre stays on its own line, at ANCHOR from the joint
+    const wx = C0.x - b.x, wy = C0.y - b.y, wd = wx * d0.x + wy * d0.y;
+    const r = Math.sqrt(Math.max(0, wd * wd - (wx * wx + wy * wy) + BODY.ANCHOR * BODY.ANCHOR));
+    const t1 = -wd + r, t2 = -wd - r, t = Math.abs(t1) < Math.abs(t2) ? t1 : t2;
+    b.beta = wrap(Math.atan2(C0.y + t * d0.y - b.y, C0.x + t * d0.x - b.x) - (b.psi + Math.PI));
+    b.travelled += ds;
+  }
+
+  // one tick. cmd = {go, aim}: aim is the wanted head bend, + = right
+  b.step = function (dt, cmd) {
+    // the head never rests: it sweeps side to side while the larva is on the move
+    if (cmd.go) b.scanPhase += 2 * Math.PI * dt * b.tempo / GAIT.STROKE_S;
+    const scan = cmd.go ? GAIT.SCAN * DEG * Math.sin(b.scanPhase) : 0;
+    // on the back the head stays almost on the body axis; on a side it turns to the target
+    const steerMax = P.legs === 0 ? GAIT.HEAD_STEER * DEG : BEND;
+    const steer = clamp(cmd.aim || 0, -steerMax, steerMax);
+    const want = clamp(steer + scan, -BEND, BEND);
+    const rate = GAIT.HEAD_RATE * DEG * dt;
+    b.delta += clamp(wrap(want - b.delta), -rate, rate);
+
+    // On the back: between pushes the front is swung round toward the target, the
+    // whole body pivoting at the tail–middle joint. During a push the front goes straight.
+    const pushingNow = b.inStroke && !b.halted && b.f >= 0.45 && b.f < 0.80;
+    if (P.legs === 0 && cmd.go && !pushingNow) {
+      const turn = clamp(cmd.aim || 0, -GAIT.FRONT_SWING * DEG * dt, GAIT.FRONT_SWING * DEG * dt);
+      b.psi = wrap(b.psi - turn);
+    }
+
+    if (!b.inStroke) {
+      b.pushing = false;
+      if (!cmd.go) { b.phase = 'still'; if (P.legs === 0) b.lam = GAIT.LIFT * DEG; return; }
+      b.inStroke = true; b.f = 0; b.pushed = 0; b.recoverStarted = false; b.halted = false;
+      // on a side the tail always curls toward the legs; on the back it alternates
+      if (P.legs !== 0) b.sign = P.legs;
+      else { b.sign = b.nextSign; b.nextSign = -b.nextSign; }
+      b.betaS = b.beta;
+    }
+    // told to stop mid-stroke: the front stays put, the tail only straightens back
+    if (!cmd.go && !b.halted && b.f < 0.80) { b.halted = true; b.f = 0.80; }
+    b.f += dt * b.tempo / GAIT.STROKE_S;
+    // On the back the tail works like an oar: it touches the floor only to push,
+    // left, then right, and is held up in between so it does not drag.
+    const paddle = P.legs === 0;
+    const f = b.f, L = GAIT.LIFT * DEG, target = b.sign * (P.legs !== 0 ? GAIT.SWEEP_SIDE : GAIT.SWEEP_BACK) * DEG;
+    b.pushing = false;
+
+    if (f < 0.05) b.phase = 'rest';
+    else if (f < 0.38 && !b.halted) {
+      const g = (f - 0.05) / 0.33;
+      b.beta = b.betaS + (target - b.betaS) * smooth(g);
+      b.lam = paddle ? L : L * smooth(g / 0.3);
+      b.phase = 'swing';
+    } else if (f < 0.45 && !b.halted) {
+      b.beta = target;
+      b.lam = L * (1 - smooth((f - 0.38) / 0.07));
+      b.phase = 'set';
+    }
+    if (!b.halted && (f >= 0.45 && f < 0.80 || (f >= 0.80 && !b.recoverStarted))) {
+      b.lam = 0;
+      const g = clamp((f - 0.45) / 0.35, 0, 1);
+      const D = GAIT.STEP * (g - Math.sin(2 * Math.PI * g) / (2 * Math.PI));
+      if (D > b.pushed) { slide(D - b.pushed); b.pushed = D; }
+      b.phase = 'push'; b.pushing = true;
+    }
+    if (f >= 0.80) {
+      if (!b.recoverStarted) { b.recoverStarted = true; b.betaE = b.beta; b.lamE = b.lam; }
+      const g = clamp((f - 0.80) / 0.20, 0, 1);
+      b.beta = b.betaE * (1 - smooth(g));
+      b.lam = paddle ? L * smooth(g / 0.3) : Math.max(L * Math.sin(Math.PI * g), b.lamE * (1 - smooth(g)));
+      b.phase = 'recover'; b.pushing = false;
+    }
+    if (f >= 1) { b.beta = 0; b.lam = paddle ? L : 0; b.inStroke = false; b.phase = 'rest'; }
+  };
+
+  // words for a floor side (+1 = right of the heading), in the body's own terms
+  b.sideWord = s => P.legs === 0 ? (s > 0 ? 'its left' : 'its right') : (s === P.legs ? 'the legs' : 'the back');
+
+  b.describe = function () {
+    switch (b.phase) {
+      case 'still': return 'lying still';
+      case 'rest': return 'between strokes';
+      case 'swing': return 'tail lifted, swinging toward ' + b.sideWord(b.sign);
+      case 'set': return 'tail coming down across the line of travel';
+      case 'push': return 'tail anchored, pushing the front forward ' + (b.pushed * 10).toFixed(1) + ' of ' + (GAIT.STEP * 10).toFixed(1) + ' mm';
+      case 'recover': return 'tail lifted, straightening back';
+    }
+    return '';
+  };
+  return b;
+}
+
+/* ---------------- WORLD + the simulation the harness runs ---------------- */
+const ARENA = { W: 32, H: 20 };   // a bare test floor, cm
+const PX = 40;                     // px per cm: 0.5 mm = 2 px
+const TARGET_R = 0.3;
+const MAX_TIME = 900;              // s
+
+const SKILLS = [
+  { value: 'crawl-left',  label: 'Crawl to target on the left side',  posture: 'left' },
+  { value: 'crawl-right', label: 'Crawl to target on the right side', posture: 'right' },
+  { value: 'crawl-back',  label: 'Crawl to target on the back',       posture: 'back' },
+  { value: 'roll-lr', label: 'Roll left → right over the back (next)', disabled: true },
+  { value: 'roll-rl', label: 'Roll right → left over the back (next)', disabled: true },
+  { value: 'ring-l',  label: 'Curl on the left side, crawl round, push aside (next)', disabled: true },
+  { value: 'ring-r',  label: 'Curl on the right side, crawl round, push aside (next)', disabled: true },
+  { value: 'tail-l',  label: 'On the left side: tail toward legs / back / up (next)', disabled: true },
+  { value: 'tail-r',  label: 'On the right side: tail toward legs / back / up (next)', disabled: true },
+  { value: 'fore-l',  label: 'On the left side: front twisted legs under (next)', disabled: true },
+  { value: 'fore-r',  label: 'On the right side: front twisted legs under (next)', disabled: true }
+];
+
+const SCHEMA = [
+  { key: 'skill', label: 'Skill', type: 'select', value: 'crawl-left', options: SKILLS },
+  { key: 'distance', label: 'Target distance', type: 'number', min: 3, max: 12, step: 0.5, value: 8, unit: 'cm',
+    hint: 'Where the target starts, in any direction, behind included. Click the floor to move it.' }
+];
+
+const SkillBench = {
+  create(params, rng) {
+    const skill = SKILLS.find(s => s.value === params.skill);
+    const rL = rng('larva'), rT = rng('target');
+    const body = makeBody(skill.posture, rL);
+    body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+    body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+    body.psi = rL.range(-Math.PI, Math.PI);
+    let target = null;
+    for (let i = 0; i < 400 && !target; i++) {
+      const a = rT.range(-Math.PI, Math.PI);
+      const t = { x: body.x + Math.cos(a) * params.distance, y: body.y + Math.sin(a) * params.distance };
+      if (t.x > 2 && t.x < ARENA.W - 2 && t.y > 2 && t.y < ARENA.H - 2) target = t;
+    }
+    if (!target) target = { x: ARENA.W - 3, y: ARENA.H / 2 };
+
+    let cmd = { go: true, aim: 0 }, arrived = false, arrivedFor = 0, userMoved = false, drag = null;
+    let off = 0, dist = 0;
+    const trail = [];
+    let tickN = 0;
+
+    // where the target lies, seen from the front end: distance, and the
+    // angle off the middle's axis (+ = right). This is the skill's command.
+    function measure() {
+      const p = body.points();
+      dist = Math.hypot(target.x - p.head.x, target.y - p.head.y);
+      off = -wrap(Math.atan2(target.y - p.MH.y, target.x - p.MH.x) - body.psi);
+      if (dist < TARGET_R + BODY.HEAD_D / 2) arrived = true;
+    }
+
+    const sim = {
+      step(dt) {
+        tickN++;
+        measure();
+        cmd = arrived ? { go: false, aim: body.delta } : { go: true, aim: off };
+        body.step(dt, cmd);
+        if (arrived && !body.inStroke) arrivedFor += dt; else arrivedFor = 0;
+        if (tickN % 3 === 0) { trail.push(body.points().head); if (trail.length > 3000) trail.shift(); }
+      },
+      status() {
+        const detail = 'on its ' + body.label + ' · ' + body.describe() + ' · crawled ' + body.travelled.toFixed(1) + ' cm';
+        if (arrived) return { action: 'AT TARGET', reason: 'head against the target — stopped', detail };
+        // numbers go in the detail line; the reason changes only when the situation does
+        const deg = Math.abs(off) / DEG;
+        const side = body.sideWord(off > 0 ? 1 : -1);
+        const reason = deg < 10 ? 'target straight ahead — head pointing at it'
+          : body.legs === 0 ? 'target off toward ' + side + ' — swinging the front round between pushes'
+          : Math.abs(off) > body.BEND ? 'target behind, toward ' + side + ' — head bent as far as the joint goes'
+          : 'target off toward ' + side + ' — head turned to it';
+        return { action: 'CRAWLING TO TARGET', reason,
+          detail: 'target ' + dist.toFixed(1) + ' cm, ' + deg.toFixed(0) + '° off the body axis · ' + detail };
+      },
+      done() {
+        if (arrivedFor >= 1.5) return { ok: true, why: 'reached the target' };
+        if (tickN * Harness.DT > MAX_TIME) return { ok: false, why: 'did not reach the target in ' + MAX_TIME + ' s' };
+        return null;
+      },
+      snapshot() {
+        const p = body.points();
+        const s = {
+          x: body.x, y: body.y, psi: body.psi,
+          beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: +body.delta.toFixed(5),
+          head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) },
+          tailC: { x: p.tailC.x, y: p.tailC.y }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+          phase: body.phase, pushing: body.pushing, arrived,
+          target: { x: +target.x.toFixed(3), y: +target.y.toFixed(3) },
+          skipChecks: userMoved
+        };
+        userMoved = false;
+        return s;
+      },
+      invariants: [
+        { name: 'jump', check: (a, b) => {
+          const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
+          return d > 0.05 ? 'head moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } },
+        { name: 'fan', check: (a, b) => {
+          const w = Math.abs(wrap(b.psi - a.psi)) / Harness.DT / DEG;
+          return w > 90 ? 'body turned at ' + w.toFixed(0) + '°/s' : null; } },
+        { name: 'joints', check: (a, b) => {
+          const lim = JOINT.BEND * DEG + 0.5 * DEG;
+          if (Math.abs(b.beta) > lim) return 'tail–middle bent ' + (Math.abs(b.beta) / DEG).toFixed(1) + '°, the joint allows ' + JOINT.BEND + '°';
+          if (Math.abs(b.delta) > lim) return 'middle–head bent ' + (Math.abs(b.delta) / DEG).toFixed(1) + '°, the joint allows ' + JOINT.BEND + '°';
+          if (b.lam < -1e-9 || b.lam > lim) return 'tail lift ' + (b.lam / DEG).toFixed(1) + '° out of range';
+          return null; } },
+        { name: 'ground law', check: (a, b) => {
+          if (!(a.pushing && b.pushing)) return null;
+          // the tail centre slides only along the tail
+          const d = { x: Math.cos(a.psi + Math.PI + a.beta), y: Math.sin(a.psi + Math.PI + a.beta) };
+          const mx = b.tailC.x - a.tailC.x, my = b.tailC.y - a.tailC.y;
+          const n = Math.abs(-mx * d.y + my * d.x);
+          if (n > 2e-4) return 'tail slid sideways ' + (n * 10).toFixed(3) + ' mm';
+          // the back end of the middle slides only along the middle
+          const u = { x: Math.cos(b.psi), y: Math.sin(b.psi) };
+          const q = Math.abs(-(b.x - a.x) * u.y + (b.y - a.y) * u.x);
+          return q > 2e-4 ? 'middle slid sideways ' + (q * 10).toFixed(3) + ' mm' : null; } },
+        { name: 'floor', check: (a, b) => {
+          for (const p of [b.head, b.tailEnd, { x: b.x, y: b.y }])
+            if (p.x < 0 || p.y < 0 || p.x > ARENA.W || p.y > ARENA.H) return 'body left the test floor';
+          return null; } }
+      ],
+
+      pointer(kind, px, py, extra) {
+        const w = { x: px / PX, y: ARENA.H - py / PX };
+        const pts = body.points();
+        const near = [pts.TM, pts.MH, pts.head, pts.tailC, pts.tailEnd].some(p => Math.hypot(p.x - w.x, p.y - w.y) < 0.6);
+        if (kind === 'down') {
+          if (near) drag = { dx: body.x - w.x, dy: body.y - w.y };
+          else if (w.x > 0.5 && w.x < ARENA.W - 0.5 && w.y > 0.5 && w.y < ARENA.H - 0.5) {
+            target.x = w.x; target.y = w.y; arrived = false;
+          }
+          return true;
+        }
+        if (kind === 'move' && drag) {
+          body.x = clamp(w.x + drag.dx, 2, ARENA.W - 2); body.y = clamp(w.y + drag.dy, 2, ARENA.H - 2);
+          userMoved = true; arrived = false; trail.length = 0; return true;
+        }
+        if (kind === 'up') { drag = null; return true; }
+        if (kind === 'wheel' && near) {
+          body.psi = wrap(body.psi + extra.delta * 5 * DEG); userMoved = true; arrived = false; return true;
+        }
+        return false;
+      },
+
+      draw(ctx, W, H) { drawScene(ctx, W, H, body, target, trail); }
+    };
+    sim.body = body; sim.target = target;
+    return sim;
+  },
+  drawEmpty(ctx, W, H) { drawFloor(ctx, W, H); }
+};
+
+/* ---------------- drawing: lines on white ---------------- */
+function X(x) { return x * PX; }
+function Y(y) { return (ARENA.H - y) * PX; }
+
+function drawFloor(ctx, W, H) {
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, W - 1, H - 1);
+  ctx.beginPath(); ctx.moveTo(14, H - 14); ctx.lineTo(14 + PX, H - 14);
+  ctx.moveTo(14, H - 18); ctx.lineTo(14, H - 10); ctx.moveTo(14 + PX, H - 18); ctx.lineTo(14 + PX, H - 10); ctx.stroke();
+  ctx.fillStyle = '#000'; ctx.font = '11px Helvetica, Arial, sans-serif'; ctx.fillText('1 cm', 14, H - 22);
+}
+
+function capsule(ctx, a, b, r, dashed) {
+  const ang = Math.atan2(-(b.y - a.y), b.x - a.x);
+  const ax = X(a.x), ay = Y(a.y), bx = X(b.x), by = Y(b.y), R = r * PX;
+  ctx.beginPath();
+  ctx.arc(bx, by, R, ang - Math.PI / 2, ang + Math.PI / 2);
+  ctx.arc(ax, ay, R, ang + Math.PI / 2, ang + 3 * Math.PI / 2);
+  ctx.closePath();
+  ctx.setLineDash(dashed ? [3, 3] : []);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawScene(ctx, W, H, body, target, trail) {
+  drawFloor(ctx, W, H);
+  if (trail.length > 1) {
+    ctx.strokeStyle = '#bbb'; ctx.lineWidth = 1; ctx.beginPath();
+    trail.forEach((p, i) => (i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y))));
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(X(target.x), Y(target.y), TARGET_R * PX, 0, 2 * Math.PI); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(X(target.x) - 5, Y(target.y)); ctx.lineTo(X(target.x) + 5, Y(target.y));
+  ctx.moveTo(X(target.x), Y(target.y) - 5); ctx.lineTo(X(target.x), Y(target.y) + 5); ctx.stroke();
+
+  const p = body.points();
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1.3;
+  capsule(ctx, p.TM, p.tailEnd, BODY.TAIL_D / 2, body.lam > 1 * DEG);   // dashed = lifted off the floor
+  capsule(ctx, p.TM, p.MH, BODY.MID_D / 2, false);
+  ctx.beginPath(); ctx.arc(X(p.head.x), Y(p.head.y), BODY.HEAD_D / 2 * PX, 0, 2 * Math.PI); ctx.stroke();
+
+  // legs: three ticks on the side they face; three dots when they face up
+  const u = body.u(), rr = { x: u.y, y: -u.x };
+  ctx.fillStyle = '#000';
+  for (let i = 1; i <= 3; i++) {
+    const t = i / 4, c = { x: p.TM.x + u.x * BODY.MID_LEN * t, y: p.TM.y + u.y * BODY.MID_LEN * t };
+    if (body.legs !== 0) {
+      const s = body.legs, r0 = BODY.MID_D / 2, r1 = r0 + 0.14;
+      ctx.beginPath();
+      ctx.moveTo(X(c.x + rr.x * s * r0), Y(c.y + rr.y * s * r0));
+      ctx.lineTo(X(c.x + rr.x * s * r1), Y(c.y + rr.y * s * r1));
+      ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.arc(X(c.x), Y(c.y), 1.6, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+  drawSideView(ctx, W, H, body);
+}
+
+// a small view from the side: shows what the top view cannot — the tail off the floor
+function drawSideView(ctx, W, H, body) {
+  const bw = 230, bh = 84, x0 = W - bw - 10, y0 = 10, K = 46;
+  ctx.fillStyle = '#fff'; ctx.fillRect(x0, y0, bw, bh);
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1);
+  const fy = y0 + bh - 14, ox = x0 + 130;
+  ctx.beginPath(); ctx.moveTo(x0 + 6, fy); ctx.lineTo(x0 + bw - 6, fy); ctx.stroke();
+  const sx = v => ox + v * K, sy = z => fy - z * K;
+  const seg = (ax, az, bx, bz, r, dashed) => {
+    const ang = Math.atan2(-(bz - az), bx - ax);
+    ctx.beginPath();
+    ctx.arc(sx(bx), sy(bz), r * K, ang - Math.PI / 2, ang + Math.PI / 2);
+    ctx.arc(sx(ax), sy(az), r * K, ang + Math.PI / 2, ang + 3 * Math.PI / 2);
+    ctx.closePath(); ctx.setLineDash(dashed ? [3, 3] : []); ctx.stroke(); ctx.setLineDash([]);
+  };
+  ctx.lineWidth = 1.2;
+  const zT = BODY.TAIL_D / 2;
+  seg(0, BODY.MID_D / 2, BODY.MID_LEN, BODY.MID_D / 2, BODY.MID_D / 2, false);
+  const tx = -BODY.TAIL_LEN * Math.cos(body.lam) * Math.cos(body.beta), tz = zT + BODY.TAIL_LEN * Math.sin(body.lam);
+  seg(0, zT, tx, tz, BODY.TAIL_D / 2, body.lam > 1 * DEG);
+  // the head hangs off the front of the middle, tilted up: it does not touch the ground
+  const hr = BODY.HEAD_D / 2;
+  const hx = BODY.MID_LEN + hr * Math.cos(body.headLift) * Math.cos(body.delta);
+  const hz = BODY.MID_D / 2 + hr * Math.sin(body.headLift);
+  ctx.beginPath(); ctx.arc(sx(hx), sy(hz), hr * K, 0, 2 * Math.PI); ctx.stroke();
+  ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
+  ctx.fillText('side view · tail lift ' + (body.lam / DEG).toFixed(0) + '°', x0 + 6, y0 + 12);
+}
+
+/* ---------------- the page ---------------- */
+if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
+  document.getElementById('bench-host').innerHTML =
+    '<p style="padding:24px;max-width:560px;font-size:15px">Не найден файл <b>harness.js</b>. ' +
+    'Он должен лежать в той же папке, что и skill-bench.html (в репозитории — в корне, рядом). ' +
+    'Без него стенду нечем управлять: кнопки, время и журнал живут там.</p>';
+} else if (typeof document !== 'undefined') {
+  Harness.mount({
+    host: document.getElementById('bench-host'),
+    title: 'LARVAE — skill bench, one larva',
+    page: 'skill-bench.html',
+    factory: SkillBench,
+    schema: SCHEMA,
+    canvas: { width: ARENA.W * PX, height: ARENA.H * PX },
+    extra(box) {
+      const rows = [
+        ['tail', BODY.TAIL_LEN + ' × ' + BODY.TAIL_D + ' cm, 0.49 g, soft'],
+        ['middle (legs, jaws not drawn)', BODY.MID_LEN + ' × ' + BODY.MID_D + ' cm, 0.23 g, soft'],
+        ['head', '⌀ ' + BODY.HEAD_D + ' cm, 0.07 g, hard'],
+        ['both joints, bend', JOINT.BEND + '° in any direction — enough for the hook in the drawing'],
+        ['both joints, twist', JOINT.TWIST + '° — front twisted under; rolling over the back'],
+        ['stroke', GAIT.STROKE_S + ' s, ' + GAIT.STEP * 10 + ' mm, tail lifted ' + GAIT.LIFT + '° while it swings'],
+        ['tail on a side', 'curled toward the legs every stroke, ' + GAIT.SWEEP_SIDE + '°'],
+        ['tail on the back', 'pushes off left, lifts, pushes off right, lifts — ' + GAIT.SWEEP_BACK + '° to each side; touches the floor only to push'],
+        ['turning on the back', 'head within ±' + GAIT.HEAD_STEER + '° of the body axis; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s'],
+        ['head', 'held up ' + GAIT.HEAD_LIFT + '° off the ground, sweeping ±' + GAIT.SCAN + '° once a stroke']
+      ];
+      box.innerHTML = '<details><summary>Body</summary><table class="bench-table">' +
+        rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('') +
+        '</table><p class="hz-mute">Top view: dashed tail = lifted off the floor. Ticks on the middle = the side the legs face; dots = legs facing up (on the back). Click the floor to move the target; drag the larva to move it, wheel over it to turn it.</p></details>';
+    }
+  });
+}
+if (typeof module !== 'undefined') module.exports = { SkillBench, SCHEMA, makeBody };
+</script>
+</body>
+</html>
