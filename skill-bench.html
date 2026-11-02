@@ -252,8 +252,8 @@ const SKILLS = [
   { value: 'roll-rl', label: 'Roll from the right side to the left, over the back', kind: 'roll', from: 'right', to: 'left' },
   { value: 'ring-l',  label: 'Curl on the left side, crawl round, push aside (next)', disabled: true },
   { value: 'ring-r',  label: 'Curl on the right side, crawl round, push aside (next)', disabled: true },
-  { value: 'tail-l',  label: 'On the left side: tail toward legs / back / up (next)', disabled: true },
-  { value: 'tail-r',  label: 'On the right side: tail toward legs / back / up (next)', disabled: true },
+  { value: 'tail-l',  label: 'On the left side: tail toward the legs, the back, up', kind: 'poses', posture: 'left' },
+  { value: 'tail-r',  label: 'On the right side: tail toward the legs, the back, up', kind: 'poses', posture: 'right' },
   { value: 'fore-l',  label: 'On the left side: front twisted legs under (next)', disabled: true },
   { value: 'fore-r',  label: 'On the right side: front twisted legs under (next)', disabled: true }
 ];
@@ -263,13 +263,20 @@ const SCHEMA = [
   { key: 'distance', label: 'Target distance', type: 'number', min: 3, max: 12, step: 0.5, value: 8, unit: 'cm',
     hint: 'Where the target starts, in any direction, behind included. Click the floor to move it.' },
   { key: 'curl', label: 'Roll: starting curl', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
-    hint: 'How far the tail is bent toward the legs before the roll. Any bend works: it straightens out first.' }
+    hint: 'How far the tail is bent toward the legs before the roll. Any bend works: it straightens out first.' },
+  { key: 'toLegs', label: 'Tail poses: toward the legs', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
+    hint: 'Tail–middle bend toward the legs, along the floor. 110° is the hook in your drawing.' },
+  { key: 'toBack', label: 'Tail poses: toward the back', type: 'number', min: 0, max: 120, step: 5, value: 30, unit: '°',
+    hint: 'Tail–middle bend toward the back, along the floor.' },
+  { key: 'up', label: 'Tail poses: up off the bowl', type: 'number', min: 0, max: 120, step: 5, value: 45, unit: '°',
+    hint: 'Tail lifted off the floor, lying on a side.' }
 ];
 
 const SkillBench = {
   create(params, rng) {
     const skill = SKILLS.find(s => s.value === params.skill);
     if (skill.kind === 'roll') return createRoll(skill, rng, params.curl);
+    if (skill.kind === 'poses') return createPoses(skill, rng, params);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -473,6 +480,82 @@ function createRoll(skill, rng, startCurl) {
   };
 }
 
+
+/* ---------------- TAIL POSES on a side ----------------
+   Lying on a side, on the spot: the tail goes toward the legs and back to
+   straight, toward the back and back to straight, then up off the floor and
+   back down. Along the floor the bend is in the floor plane; "up" lifts the
+   tail out of it. The three angles are the observer's to set. */
+const POSE_T = { RATE: 60, MIN_MOVE: 0.5, HOLD: 1.0 };   // tail moves at about 60°/s on average; holds 1 s
+
+function createPoses(skill, rng, params) {
+  const rL = rng('larva');
+  const body = makeBody(skill.posture, rL);
+  body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+  body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+  body.psi = rL.range(-Math.PI, Math.PI);
+  const legs = POSTURES[skill.posture].legs;
+  const steps = [
+    { name: 'toward the legs', beta: legs * params.toLegs * DEG, lam: 0 },
+    { name: 'toward the back', beta: -legs * params.toBack * DEG, lam: 0 },
+    { name: 'up off the bowl', beta: 0, lam: params.up * DEG }
+  ];
+  // each pose takes as long as its angle needs, so the tail never jerks
+  for (const st of steps) {
+    st.move = Math.max(POSE_T.MIN_MOVE, Math.max(Math.abs(st.beta), st.lam) / DEG / POSE_T.RATE);
+    st.len = 2 * st.move + POSE_T.HOLD;
+  }
+  const total = steps.reduce((a, st) => a + st.len, 0) + POSE_T.HOLD;
+  const start = { x: body.x, y: body.y };
+  let t = 0, phase = 'straight', cur = null;
+
+  function pose() {
+    let k = 0, u = t;
+    while (k < steps.length && u >= steps[k].len) { u -= steps[k].len; k++; }
+    if (k >= steps.length) { phase = 'done'; body.beta = 0; body.lam = 0; cur = null; return; }
+    cur = steps[k];
+    const M = cur.move;
+    let a;
+    if (u < M) { a = smooth(u / M); phase = 'out'; }
+    else if (u < M + POSE_T.HOLD) { a = 1; phase = 'hold'; }
+    else { a = 1 - smooth((u - M - POSE_T.HOLD) / M); phase = 'back'; }
+    body.beta = cur.beta * a; body.lam = cur.lam * a; body.delta = 0;
+  }
+  pose();
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; pose(); },
+    status() {
+      const detail = 'on its ' + body.label + ' · tail bent ' + Math.abs(Math.round(body.beta / DEG)) + '° along the floor, lifted ' + Math.round(body.lam / DEG) + '°';
+      if (!cur) return { action: 'TAIL STRAIGHT', reason: 'all three poses done', detail };
+      const what = 'TAIL ' + cur.name.toUpperCase();
+      if (phase === 'out') return { action: what, reason: 'moving the tail into the pose, on the spot', detail };
+      if (phase === 'hold') return { action: what, reason: 'holding the pose', detail };
+      return { action: 'TAIL STRAIGHTENING', reason: 'back from ' + cur.name, detail };
+    },
+    done() { return t >= total ? { ok: true, why: 'took all three tail poses, on the spot' } : null; },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: 0,
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+        phase, pose: cur ? cur.name : 'straight', pushing: false, skipChecks: false };
+    },
+    invariants: [
+      { name: 'joints', check: (a, b) => (Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG || b.lam > JOINT.BEND * DEG + 0.5 * DEG || b.lam < -1e-9)
+        ? 'tail past the joint limit of ' + JOINT.BEND + '°' : null },
+      { name: 'on the spot', check: (a, b) => {
+        const d = Math.hypot(b.x - start.x, b.y - start.y);
+        return d > 0.01 ? 'body moved ' + (d * 10).toFixed(1) + ' mm along the floor' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.tailEnd.x - a.tailEnd.x, b.tailEnd.y - a.tailEnd.y);
+        return d > 0.15 ? 'tail tip moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
+  };
+}
+
 /* ---------------- drawing: lines on white ---------------- */
 function X(x) { return x * PX; }
 function Y(y) { return (ARENA.H - y) * PX; }
@@ -539,9 +622,11 @@ function drawScene(ctx, W, H, body, target, trail) {
 
 // a small view from the side: shows what the top view cannot — the tail off the floor
 function drawSideView(ctx, W, H, body) {
-  const bw = 230, bh = 84, x0 = W - bw - 10, y0 = 10, K = 46;
+  const bw = 230, bh = 110, x0 = W - bw - 10, y0 = 10, K = 36;
   ctx.fillStyle = '#fff'; ctx.fillRect(x0, y0, bw, bh);
   ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1);
+  // nothing drawn in the side view may spill out of its box
+  ctx.save(); ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, bh - 2); ctx.clip();
   const fy = y0 + bh - 14, ox = x0 + 130;
   ctx.beginPath(); ctx.moveTo(x0 + 6, fy); ctx.lineTo(x0 + bw - 6, fy); ctx.stroke();
   const sx = v => ox + v * K, sy = z => fy - z * K;
@@ -564,6 +649,7 @@ function drawSideView(ctx, W, H, body) {
   ctx.beginPath(); ctx.arc(sx(hx), sy(hz), hr * K, 0, 2 * Math.PI); ctx.stroke();
   ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
   ctx.fillText('side view · tail lift ' + (body.lam / DEG).toFixed(0) + '°', x0 + 6, y0 + 12);
+  ctx.restore();
   // the body seen end-on from behind, in its own box: which way the legs point
   const bx0 = x0, by0 = y0 + bh + 6, bs = 84;
   ctx.fillStyle = '#fff'; ctx.fillRect(bx0, by0, bs, bs);
