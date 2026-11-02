@@ -116,25 +116,17 @@ function makeBody(posture, rnd) {
     };
   };
 
-  // Ground law. The head leads: the front end goes where the head points.
-  // The middle is drawn after it and cannot slide sideways. The tail
-  // bears on the ground at its centre and can slide only along itself.
-  function slide(ds) {
-    const d0 = b.tailDir();
-    const C0 = { x: b.x + d0.x * BODY.ANCHOR, y: b.y + d0.y * BODY.ANCHOR };
+  // The front advances, led by the head, the middle drawn after it without
+  // sliding sideways. The tail's bend is set by the stroke itself: it is
+  // straightening on the floor while it pushes.
+  function slideFront(ds) {
     const u = b.u(), h = b.headDir();
     const MH = { x: b.x + u.x * BODY.MID_LEN + h.x * ds, y: b.y + u.y * BODY.MID_LEN + h.y * ds };
     const headAngle = b.psi - b.delta;
-    // the middle follows the front end like a towed bar
     const vx = MH.x - b.x, vy = MH.y - b.y, L = Math.hypot(vx, vy);
     b.x = MH.x - vx / L * BODY.MID_LEN; b.y = MH.y - vy / L * BODY.MID_LEN;
     b.psi = Math.atan2(vy, vx);
-    b.delta = wrap(b.psi - headAngle);        // the head keeps pointing where it pointed
-    // the tail centre stays on its own line, at ANCHOR from the joint
-    const wx = C0.x - b.x, wy = C0.y - b.y, wd = wx * d0.x + wy * d0.y;
-    const r = Math.sqrt(Math.max(0, wd * wd - (wx * wx + wy * wy) + BODY.ANCHOR * BODY.ANCHOR));
-    const t1 = -wd + r, t2 = -wd - r, t = Math.abs(t1) < Math.abs(t2) ? t1 : t2;
-    b.beta = wrap(Math.atan2(C0.y + t * d0.y - b.y, C0.x + t * d0.x - b.x) - (b.psi + Math.PI));
+    b.delta = wrap(b.psi - headAngle);
     b.travelled += ds;
   }
 
@@ -152,7 +144,7 @@ function makeBody(posture, rnd) {
 
     // On the back: between pushes the front is swung round toward the target, the
     // whole body pivoting at the tail–middle joint. During a push the front goes straight.
-    const pushingNow = b.inStroke && !b.halted && b.f >= 0.45 && b.f < 0.80;
+    const pushingNow = b.inStroke && !b.halted && b.f >= 0.45 && b.f < 0.95;
     if (P.legs === 0 && cmd.go && !pushingNow) {
       const turn = clamp(cmd.aim || 0, -GAIT.FRONT_SWING * DEG * dt, GAIT.FRONT_SWING * DEG * dt);
       b.psi = wrap(b.psi - turn);
@@ -160,48 +152,54 @@ function makeBody(posture, rnd) {
 
     if (!b.inStroke) {
       b.pushing = false;
-      if (!cmd.go) { b.phase = 'still'; if (P.legs === 0) b.lam = GAIT.LIFT * DEG; return; }
-      b.inStroke = true; b.f = 0; b.pushed = 0; b.recoverStarted = false; b.halted = false;
+      if (!cmd.go) { b.phase = 'still'; b.lam = P.legs === 0 ? GAIT.LIFT * DEG : 0; return; }
+      b.inStroke = true; b.f = 0; b.pushed = 0; b.halted = false;
       // on a side the tail always curls toward the legs; on the back it alternates
       if (P.legs !== 0) b.sign = P.legs;
       else { b.sign = b.nextSign; b.nextSign = -b.nextSign; }
-      b.betaS = b.beta;
+      b.betaS = b.beta; b.lamS = b.lam;
     }
-    // told to stop mid-stroke: the front stays put, the tail only straightens back
-    if (!cmd.go && !b.halted && b.f < 0.80) { b.halted = true; b.f = 0.80; }
+    // told to stop mid-stroke: the front stays where it is, the tail straightens
+    if (!cmd.go && !b.halted) { b.halted = true; b.betaH = b.beta; b.lamH = b.lam; b.fH = b.f; }
     b.f += dt * b.tempo / GAIT.STROKE_S;
-    // On the back the tail works like an oar: it touches the floor only to push,
-    // left, then right, and is held up in between so it does not drag.
-    const paddle = P.legs === 0;
-    const f = b.f, L = GAIT.LIFT * DEG, target = b.sign * (P.legs !== 0 ? GAIT.SWEEP_SIDE : GAIT.SWEEP_BACK) * DEG;
+    const f = b.f, L = GAIT.LIFT * DEG;
+    const target = b.sign * (P.legs !== 0 ? GAIT.SWEEP_SIDE : GAIT.SWEEP_BACK) * DEG;
     b.pushing = false;
 
-    if (f < 0.05) b.phase = 'rest';
-    else if (f < 0.38 && !b.halted) {
-      const g = (f - 0.05) / 0.33;
-      b.beta = b.betaS + (target - b.betaS) * smooth(g);
-      b.lam = paddle ? L : L * smooth(g / 0.3);
+    if (b.halted) {
+      const g = clamp((f - b.fH) / 0.2, 0, 1);
+      b.beta = b.betaH * (1 - smooth(g));
+      const restLam = P.legs === 0 ? L : 0;
+      b.lam = b.lamH + (restLam - b.lamH) * smooth(g);
+      b.phase = 'recover';
+      if (g >= 1) { b.inStroke = false; b.phase = 'still'; }
+      return;
+    }
+
+    // One stroke: the tail comes up, swings out bent, is laid on the floor at
+    // its widest bend, and pushes while it straightens on the floor. Straight
+    // again, it comes up for the next stroke.
+    if (f < 0.05) {                                     // lift
+      b.lam = b.lamS + (L - b.lamS) * smooth(f / 0.05);
+      b.phase = 'lift';
+    } else if (f < 0.38) {                              // swing out, in the air
+      b.lam = L;
+      b.beta = b.betaS + (target - b.betaS) * smooth((f - 0.05) / 0.33);
       b.phase = 'swing';
-    } else if (f < 0.45 && !b.halted) {
+    } else if (f < 0.45) {                              // laid down at the widest bend
       b.beta = target;
       b.lam = L * (1 - smooth((f - 0.38) / 0.07));
       b.phase = 'set';
-    }
-    if (!b.halted && (f >= 0.45 && f < 0.80 || (f >= 0.80 && !b.recoverStarted))) {
+    } else {                                            // push: straightening on the floor
       b.lam = 0;
-      const g = clamp((f - 0.45) / 0.35, 0, 1);
+      const g = clamp((f - 0.45) / 0.50, 0, 1);
+      b.beta = target * (1 - smooth(g));
       const D = GAIT.STEP * (g - Math.sin(2 * Math.PI * g) / (2 * Math.PI));
-      if (D > b.pushed) { slide(D - b.pushed); b.pushed = D; }
-      b.phase = 'push'; b.pushing = true;
+      if (D > b.pushed) { slideFront(D - b.pushed); b.pushed = D; }
+      b.phase = g < 1 ? 'push' : 'rest';
+      b.pushing = g < 1;
     }
-    if (f >= 0.80) {
-      if (!b.recoverStarted) { b.recoverStarted = true; b.betaE = b.beta; b.lamE = b.lam; }
-      const g = clamp((f - 0.80) / 0.20, 0, 1);
-      b.beta = b.betaE * (1 - smooth(g));
-      b.lam = paddle ? L * smooth(g / 0.3) : Math.max(L * Math.sin(Math.PI * g), b.lamE * (1 - smooth(g)));
-      b.phase = 'recover'; b.pushing = false;
-    }
-    if (f >= 1) { b.beta = 0; b.lam = paddle ? L : 0; b.inStroke = false; b.phase = 'rest'; }
+    if (f >= 1) { b.beta = 0; b.lam = 0; b.inStroke = false; b.phase = 'rest'; }
   };
 
   // words for a floor side (+1 = right of the heading), in the body's own terms
@@ -210,11 +208,12 @@ function makeBody(posture, rnd) {
   b.describe = function () {
     switch (b.phase) {
       case 'still': return 'lying still';
-      case 'rest': return 'between strokes';
+      case 'rest': return 'tail straight on the floor';
+      case 'lift': return 'tail coming up off the floor';
       case 'swing': return 'tail lifted, swinging toward ' + b.sideWord(b.sign);
-      case 'set': return 'tail coming down across the line of travel';
-      case 'push': return 'tail anchored, pushing the front forward ' + (b.pushed * 10).toFixed(1) + ' of ' + (GAIT.STEP * 10).toFixed(1) + ' mm';
-      case 'recover': return 'tail lifted, straightening back';
+      case 'set': return 'tail laid on the floor at its widest bend';
+      case 'push': return 'tail straightening on the floor, pushing the front forward ' + (b.pushed * 10).toFixed(1) + ' of ' + (GAIT.STEP * 10).toFixed(1) + ' mm';
+      case 'recover': return 'stopping — tail straightening';
     }
     return '';
   };
@@ -333,11 +332,6 @@ const SkillBench = {
           return null; } },
         { name: 'ground law', check: (a, b) => {
           if (!(a.pushing && b.pushing)) return null;
-          // the tail centre slides only along the tail
-          const d = { x: Math.cos(a.psi + Math.PI + a.beta), y: Math.sin(a.psi + Math.PI + a.beta) };
-          const mx = b.tailC.x - a.tailC.x, my = b.tailC.y - a.tailC.y;
-          const n = Math.abs(-mx * d.y + my * d.x);
-          if (n > 2e-4) return 'tail slid sideways ' + (n * 10).toFixed(3) + ' mm';
           // the back end of the middle slides only along the middle
           const u = { x: Math.cos(b.psi), y: Math.sin(b.psi) };
           const q = Math.abs(-(b.x - a.x) * u.y + (b.y - a.y) * u.x);
