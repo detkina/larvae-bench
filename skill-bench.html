@@ -264,7 +264,7 @@ const SKILLS = [
   { value: 'fore-l',  label: 'On the left side: front twisted, legs down', kind: 'fore', posture: 'left' },
   { value: 'fore-r',  label: 'On the right side: front twisted, legs down', kind: 'fore', posture: 'right' },
   { value: 'glass',   label: 'Reference glass: lying on the floor', kind: 'glass', posture: 'left', where: 'floor' },
-  { value: 'glass-over', label: 'Reference glass on the back: the larva turns it to cover itself', kind: 'glass', posture: 'left', where: 'over' }
+  { value: 'glass-over', label: 'Two glasses: the larva tries them on, keeps the one that covers it', kind: 'glass-try', posture: 'left' }
 ];
 
 const SCHEMA = [
@@ -284,7 +284,10 @@ const SCHEMA = [
   { key: 'foreEase', label: 'Front twist: tail unbends by', type: 'number', min: 0, max: 60, step: 5, value: 30, unit: '°',
     hint: 'While the front turns legs down, the tail straightens a little by this much.' },
   { key: 'ringTail', label: 'Ring: curl', type: 'number', min: 70, max: 105, step: 5, value: 105, unit: '°',
-    hint: 'Tail bent toward the legs. The ring is the circle the curled body lies on, as in your drawing: the tighter the curl, the smaller the ring. Up to 105°: each stroke curls the tail 15° further, and the joint stops at 120°.' }
+    hint: 'Tail bent toward the legs. The ring is the circle the curled body lies on, as in your drawing: the tighter the curl, the smaller the ring. Up to 105°: each stroke curls the tail 15° further, and the joint stops at 120°.' },
+  { key: 'firstGlass', label: 'Glasses: give first', type: 'select', value: 'small',
+    options: [{ value: 'small', label: 'the small one' }, { value: 'normal', label: 'the normal one' }],
+    hint: 'Which glass you put on the larva\'s back at Пуск. The other lies on the floor nearby.' }
 ];
 
 const SkillBench = {
@@ -295,6 +298,7 @@ const SkillBench = {
     if (skill.kind === 'fore') return createFore(skill, rng, params);
     if (skill.kind === 'ring') return createRing(skill, rng, params);
     if (skill.kind === 'glass') return createGlassBench(skill, rng, params);
+    if (skill.kind === 'glass-try') return createGlassTry(skill, rng, params);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -1157,6 +1161,188 @@ function createGlassBench(skill, rng, params) {
         ctx.strokeRect(ox + lo * K, fy - GLASS.THICK * K, (hi - lo) * K, GLASS.THICK * K);
         ctx.setLineDash([]);
         ctx.fillText('- - glass behind, 7 mm', x0 + 6, y0 + 24);
+      }
+      ctx.restore();
+    }
+  };
+}
+
+
+/* ---------------- TRYING GLASSES ON ----------------
+   Two glasses: the reference one, and the same shape at three quarters of its
+   size, which cannot cover the curled larva with 2 mm however it lies. The
+   observer gives one at Пуск; the other lies on the floor. The larva sets the
+   glass on its back by feel (as above), its legs working it in short jerks.
+   If it cannot get covered after turning the glass twice right round, it lets
+   that glass slide off onto the floor and takes the other one. The one that
+   covers it, it keeps. Taking a glass from the floor is shown as a plain move
+   here: getting under a glass and lifting it is a skill of its own, still to come. */
+const TRY = {
+  TURN: 30 * DEG, SLIDE: 0.2,   // average, per second
+  BEAT: 0.4, PUSH: 0.15,        // the legs work in beats: 0.15 s of moving in every 0.4 s
+  GIVE_UP: 4 * Math.PI,         // radians turned round without success before giving up
+  SMALL: 0.75,                  // the small glass, as a share of the reference size
+  MOVE_S: 1.5                   // seconds to slide a glass off, or onto the back
+};
+
+function createGlassTry(skill, rng, params) {
+  const body = makeBody('left', rng('larva'));
+  body.psi = 0; body.lam = 0;
+  body.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  body.delta = body.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  body.x = ARENA.W / 2 - 0.5; body.y = ARENA.H / 2 - 2;
+  const home = { x: body.x - REF_GLASS.larvaAt.x, y: body.y - REF_GLASS.larvaAt.y };   // where a glass sits on the back
+  const glasses = [
+    { name: 'small', local: REF_GLASS.local.map(q => ({ x: q.x * TRY.SMALL, y: q.y * TRY.SMALL })), floor: { x: ARENA.W / 2 - 5, y: ARENA.H / 2 + 3.5, rot: 0.4 } },
+    { name: 'normal', local: REF_GLASS.local, floor: { x: ARENA.W / 2 + 4.5, y: ARENA.H / 2 + 3.5, rot: -0.3 } }
+  ];
+  for (const g of glasses) { let a = 0; for (let i = 0, j = g.local.length - 1; i < g.local.length; j = i++) a += g.local[j].x * g.local[i].y - g.local[i].x * g.local[j].y; g.area = Math.abs(a) / 2; }
+  const firstIdx = params.firstGlass === 'normal' ? 1 : 0;
+  // every glass has a pose; the one on the back starts badly turned
+  for (const g of glasses) Object.assign(g, { x: g.floor.x, y: g.floor.y, rot: g.floor.rot, on: false, tried: false, rejected: false });
+  let cur = glasses[firstIdx];
+  Object.assign(cur, { x: home.x + 0.2, y: home.y - 0.15, rot: 70 * DEG, on: true });
+
+  const shape = g => { const c = Math.cos(g.rot), s2 = Math.sin(g.rot); return g.local.map(q => ({ x: g.x + q.x * c - q.y * s2, y: g.y + q.x * s2 + q.y * c })); };
+  const shapeAt = (g, x, y, rot) => shape({ local: g.local, x, y, rot });
+  const NAMES = ['tail', 'middle', 'head'];
+  const short = poly => {
+    let sum = 0, worst = 0, where = '';
+    curledParts(body).forEach((pt, i) => { for (let k = 0; k <= 12; k++) {
+      const t = k / 12, q = { x: pt.a.x + (pt.b.x - pt.a.x) * t, y: pt.a.y + (pt.b.y - pt.a.y) * t };
+      const d = polyEdgeDist(poly, q), m = polyContains(poly, q) ? d - pt.r : -d - pt.r;
+      const lack = Math.max(0, GLASS.MARGIN - m);
+      sum += lack; if (lack > worst) { worst = lack; where = NAMES[i]; }
+    } });
+    return { sum, where };
+  };
+  const pivot = () => { const p = body.points(); return { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }; };
+  const turned = (x, y, rot, a) => { const P = pivot(), c = Math.cos(a), s2 = Math.sin(a);
+    return { x: P.x + (x - P.x) * c - (y - P.y) * s2, y: P.y + (x - P.x) * s2 + (y - P.y) * c, rot: rot + a }; };
+
+  let t = 0, state = 'setting', work = 'turn', sweep = 1, sweepFrom = 0, swept = 0, turnedTotal = 0;
+  let move = null, drag = null, held = false, beat = 0;
+
+  function setStep(dt) {
+    // the legs work in beats: a quick shove, then a pause
+    beat = (beat + dt) % TRY.BEAT;
+    if (beat >= TRY.PUSH) return;
+    const k = TRY.BEAT / TRY.PUSH, a = TRY.TURN * dt * k, d = TRY.SLIDE * dt * k;
+    const now = short(shape(cur));
+    if (now.sum <= 1e-9) { state = 'keep'; return; }
+    if (work === 'sweep') {
+      let c = turned(cur.x, cur.y, cur.rot, sweep * a), v = short(shapeAt(cur, c.x, c.y, c.rot)).sum;
+      for (const [ex, ey] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
+        const c2 = { x: c.x + ex, y: c.y + ey, rot: c.rot }, v2 = short(shapeAt(cur, c2.x, c2.y, c2.rot)).sum;
+        if (v2 < v) { v = v2; c = c2; }
+      }
+      cur.x = c.x; cur.y = c.y; cur.rot = wrap(c.rot); swept += a; turnedTotal += a;
+      if (v < 0.6 * sweepFrom) work = 'turn';
+      else if (swept > 2 * Math.PI) { sweep = -sweep; swept = 0; }
+    } else {
+      const tries = [
+        turned(cur.x, cur.y, cur.rot, a), turned(cur.x, cur.y, cur.rot, -a),
+        { x: cur.x, y: cur.y, rot: cur.rot + a }, { x: cur.x, y: cur.y, rot: cur.rot - a },
+        { x: cur.x + d, y: cur.y, rot: cur.rot }, { x: cur.x - d, y: cur.y, rot: cur.rot },
+        { x: cur.x, y: cur.y + d, rot: cur.rot }, { x: cur.x, y: cur.y - d, rot: cur.rot }
+      ];
+      let best = null, bestS = now.sum;
+      for (const c of tries) { const v = short(shapeAt(cur, c.x, c.y, c.rot)).sum; if (v < bestS - 1e-9) { bestS = v; best = c; } }
+      if (best) {
+        if (best.rot !== cur.rot) { sweep = Math.sign(best.rot - cur.rot); turnedTotal += a; }
+        work = best.rot !== cur.rot ? 'turn' : 'slide';
+        cur.x = best.x; cur.y = best.y; cur.rot = wrap(best.rot);
+      } else { work = 'sweep'; sweepFrom = now.sum; swept = 0; }
+    }
+    if (turnedTotal > TRY.GIVE_UP) {
+      // turned it round and round and it never covered: it is the wrong glass
+      cur.rejected = true; cur.tried = true;
+      state = 'drop'; move = { g: cur, from: { x: cur.x, y: cur.y, rot: cur.rot }, to: cur.floor, t: 0 };
+    }
+  }
+
+  return {
+    body, target: null,
+    step(dt) {
+      t += dt;
+      if (drag) { held = true; return; }
+      held = false;
+      if (state === 'setting') setStep(dt);
+      else if (state === 'drop' || state === 'take') {
+        move.t += dt;
+        const g = smooth(move.t / TRY.MOVE_S), m = move;
+        m.g.x = m.from.x + (m.to.x - m.from.x) * g; m.g.y = m.from.y + (m.to.y - m.from.y) * g;
+        m.g.rot = m.from.rot + wrap(m.to.rot - m.from.rot) * g;
+        if (move.t >= TRY.MOVE_S) {
+          if (state === 'drop') {
+            m.g.on = false;
+            const other = glasses.find(x => !x.tried && x !== m.g);
+            if (other) {
+              cur = other; cur.on = true; state = 'take';
+              move = { g: cur, from: { x: cur.x, y: cur.y, rot: cur.rot }, to: { x: home.x + 0.25, y: home.y + 0.1, rot: cur.rot + 80 * DEG }, t: 0 };
+            } else state = 'none';
+          } else { state = 'setting'; work = 'turn'; turnedTotal = 0; swept = 0; }
+        }
+      }
+    },
+    status() {
+      const cnt = 'on its back: the ' + cur.name + ' glass (' + cur.area.toFixed(1) + ' cm²) · turned it ' + Math.round(turnedTotal / DEG) + '° so far';
+      if (held) return { action: 'GLASS HELD BY THE OBSERVER', reason: 'let go of it and the larva carries on', detail: cnt };
+      if (state === 'keep') return { action: 'KEEPING IT', reason: 'the ' + cur.name + ' glass covers me with 2 mm all round', detail: cnt };
+      if (state === 'drop') return { action: 'LETTING IT GO', reason: 'turned it twice right round and some of me is always in the light — this glass is no good', detail: cnt };
+      if (state === 'take') return { action: 'TAKING THE OTHER GLASS', reason: 'trying the other one instead', detail: cnt };
+      if (state === 'none') return { action: 'NO GLASS FITS', reason: 'tried both', detail: cnt };
+      const sh = short(shape(cur));
+      const reason = work === 'sweep' ? 'the ' + sh.where + ' is still in the light — turning the glass on round'
+        : work === 'slide' ? 'the ' + sh.where + ' is short of glass — shoving the glass over it with the legs'
+        : 'the ' + sh.where + ' is short of glass — turning the glass with the legs';
+      return { action: 'TRYING THE ' + cur.name.toUpperCase() + ' GLASS ON', reason, detail: cnt };
+    },
+    done() {
+      if (state === 'keep') return { ok: true, why: 'kept the ' + cur.name + ' glass' + (glasses.some(g => g.rejected) ? ', after letting the other one go' : '') };
+      if (state === 'none') return { ok: false, why: 'no glass covered it' };
+      if (t > 300) return { ok: false, why: 'still trying after 300 s' };
+      return null;
+    },
+    snapshot() { return { G: { x: cur.x, y: cur.y, rot: cur.rot }, glass: cur.name, state, held, skipChecks: held || state === 'drop' || state === 'take' }; },
+    invariants: [
+      { name: 'glass jump', check: (a, b) => { if (a.glass !== b.glass) return null; const d = Math.hypot(b.G.x - a.G.x, b.G.y - a.G.y);
+        return d > 0.1 ? 'glass moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer(kind, px, py, extra) {
+      const w = { x: px / PX, y: ARENA.H - py / PX };
+      if (state !== 'setting') return false;
+      if (kind === 'down') { if (polyContains(shape(cur), w)) drag = { dx: cur.x - w.x, dy: cur.y - w.y }; return true; }
+      if (kind === 'move' && drag) { cur.x = w.x + drag.dx; cur.y = w.y + drag.dy; return true; }
+      if (kind === 'up') { drag = null; return true; }
+      if (kind === 'wheel' && polyContains(shape(cur), w)) { cur.rot = wrap(cur.rot + extra.delta * 5 * DEG); return true; }
+      return false;
+    },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      ctx.save();
+      ctx.font = '11px Helvetica, Arial, sans-serif';
+      for (const g of glasses) {
+        const poly = shape(g);
+        ctx.beginPath(); poly.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
+        ctx.fillStyle = g === cur && g.on ? 'rgba(0,0,0,0.07)' : 'rgba(0,0,0,0.03)'; ctx.fill();
+        const covered = g === cur && state === 'keep';
+        ctx.strokeStyle = '#000'; ctx.lineWidth = g === cur && g.on ? 1.4 : 1;
+        ctx.setLineDash(g === cur && g.on ? [] : [4, 3]); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = '#000';
+        // the label sits above the glass, clear of the larva
+        let top = -Infinity, left = Infinity; for (const q of poly) { top = Math.max(top, q.y); left = Math.min(left, q.x); }
+        ctx.fillText(g.name + (g.rejected ? ' — let go' : covered ? ' — kept' : g === cur && g.on ? ' — on its back' : ' — on the floor'), X(left), Y(top) - 6);
+      }
+      ctx.fillText('drag or turn (wheel) the glass on its back and let go: the larva carries on · Пуск starts again', 14, 18);
+      // side view: the glass on the back
+      if (cur.on) {
+        const bw = 230, x0 = W - bw - 10, y0 = 10, K = 36, fy = y0 + 110 - 14, ox = x0 + 130;
+        const u = { x: Math.cos(body.psi), y: Math.sin(body.psi) };
+        let lo = Infinity, hi = -Infinity;
+        for (const q of shape(cur)) { const s3 = (q.x - body.x) * u.x + (q.y - body.y) * u.y; lo = Math.min(lo, s3); hi = Math.max(hi, s3); }
+        ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, 108); ctx.clip();
+        ctx.lineWidth = 1.2; ctx.strokeRect(ox + lo * K, fy - (BODY.TAIL_D + GLASS.THICK) * K, (hi - lo) * K, GLASS.THICK * K);
       }
       ctx.restore();
     }
