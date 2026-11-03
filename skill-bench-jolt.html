@@ -2691,9 +2691,10 @@ if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
   say('Загружаю физический движок Jolt…');
   const iso = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated;
   const JOLT_ONE = 'https://cdn.jsdelivr.net/npm/jolt-physics@1.1.0/dist/jolt-physics.wasm-compat.js';
-  const JOLT_MANY = new URL('jolt-physics.multithread.wasm-compat.js', location.href).href;
+  // (inside an artifact the page has no ordinary address, so this is only worked out when threads are possible)
+  const joltMany = () => new URL('jolt-physics.multithread.wasm-compat.js', location.href).href;
   const load = url => import(url).then(m => { globalThis.JoltFactory = m.default; return Physics.load(); });
-  (iso ? load(JOLT_MANY).then(() => { Physics.threads = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 2) - 1)); }).catch(() => load(JOLT_ONE)) : load(JOLT_ONE))
+  (iso ? Promise.resolve().then(() => load(joltMany())).then(() => { Physics.threads = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 2) - 1)); }).catch(() => load(JOLT_ONE)) : load(JOLT_ONE))
     .then(() => { host.innerHTML = ''; startBench(); })
     .catch(e => say('Не загрузился физический движок Jolt: ' + (e && e.message || e) + '. Проверь интернет и обнови страницу.'));
 }
