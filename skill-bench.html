@@ -1018,11 +1018,13 @@ function createGlassBench(skill, rng, params) {
   /* The larva works the glass on its back with its legs, by feel. It feels,
      part by part, where the glass is short of 2 mm over it (that skin gets the
      light), wiggles the glass a little each way, turning it about the point
-     over its legs and sliding it, and keeps whatever leaves less of it short.
+     over its legs or about the glass's own middle, and sliding it, and keeps
+     whatever leaves less of it short.
      When no small wiggle helps, it keeps turning the glass the same way round,
      sliding it as it goes, until it is clearly better covered than where it
      got stuck; then it goes back to small wiggles. It stops as soon as every point is covered with 2 mm. */
-  const TURN = 15 * DEG, SLIDE = 0.1;          // per second: turning, sliding
+  // speed and the point it turns about do not matter; what matters is where the glass ends up
+  const TURN = 60 * DEG, SLIDE = 0.4;          // per second: turning, sliding
   const parts = () => curledParts(body);
   const NAMES = ['tail', 'middle', 'head'];
   const short = poly => {                       // how much it is short, and where most
@@ -1051,6 +1053,7 @@ function createGlassBench(skill, rng, params) {
       const a = TURN * dt, d = SLIDE * dt;
       const tries = [
         turned(G.x, G.y, G.rot, a), turned(G.x, G.y, G.rot, -a),
+        { x: G.x, y: G.y, rot: G.rot + a }, { x: G.x, y: G.y, rot: G.rot - a },
         { x: G.x + d, y: G.y, rot: G.rot }, { x: G.x - d, y: G.y, rot: G.rot },
         { x: G.x, y: G.y + d, rot: G.rot }, { x: G.x, y: G.y - d, rot: G.rot }
       ];
@@ -1099,9 +1102,9 @@ function createGlassBench(skill, rng, params) {
     snapshot() { return { G: { x: G.x, y: G.y, rot: G.rot }, held, skipChecks: held || !over }; },
     invariants: [
       { name: 'glass jump', check: (a, b) => { const d = Math.hypot(b.G.x - a.G.x, b.G.y - a.G.y);
-        return d > 0.05 ? 'glass moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } },
+        return d > 0.1 ? 'glass moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } },
       { name: 'glass spin', check: (a, b) => { const w = Math.abs(wrap(b.G.rot - a.G.rot)) / Harness.DT / DEG;
-        return w > 30 ? 'glass turned at ' + w.toFixed(0) + '°/s' : null; } }
+        return w > 90 ? 'glass turned at ' + w.toFixed(0) + '°/s' : null; } }
     ],
     pointer(kind, px, py, extra) {
       const w = { x: px / PX, y: ARENA.H - py / PX };
