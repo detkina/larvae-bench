@@ -79,8 +79,7 @@ const GAIT = {
   BOUT_MIN: 3, BOUT_MAX: 5,   // strokes to one side before going over to the other
   LIFT: 20,            // tail lift while it swings, deg
   HEAD_LIFT: 30,       // the head is held up off the ground, never laid on it, deg
-  SCAN: 12,            // the head keeps sweeping side to side, ± deg, once a stroke
-  HEAD_STEER: 15,      // the head points toward the target by at most this much, deg
+  SCAN: 12,            // the head sways side to side, scanning, ± deg, once a stroke
   FRONT_SWING: 30,     // between pushes the front swings round at most this fast, deg/s
   TEMPO_SPREAD: 0.15,  // individual tempo ±15 %
   HEAD_RATE: 40        // the head turns smoothly, at most this fast, deg/s
@@ -129,17 +128,11 @@ function makeBody(posture, rnd) {
     };
   };
 
-  // The front advances, led by the head, the middle drawn after it without
-  // sliding sideways. The tail's bend is set by the stroke itself: it is
-  // straightening on the floor while it pushes.
+  // The front advances along the middle's own axis. The tail's bend is set by
+  // the stroke itself: it is straightening on the floor while it pushes.
   function slideFront(ds) {
-    const u = b.u(), h = b.headDir();
-    const MH = { x: b.x + u.x * BODY.MID_LEN + h.x * ds, y: b.y + u.y * BODY.MID_LEN + h.y * ds };
-    const headAngle = b.psi - b.delta;
-    const vx = MH.x - b.x, vy = MH.y - b.y, L = Math.hypot(vx, vy);
-    b.x = MH.x - vx / L * BODY.MID_LEN; b.y = MH.y - vy / L * BODY.MID_LEN;
-    b.psi = Math.atan2(vy, vx);
-    b.delta = b.clampHead(wrap(b.psi - headAngle));
+    // the body goes where the middle points; the head only scans, it does not lead
+    b.x += Math.cos(b.psi) * ds; b.y += Math.sin(b.psi) * ds;
     b.travelled += ds;
   }
 
@@ -156,9 +149,10 @@ function makeBody(posture, rnd) {
     // the head never rests: it sweeps side to side while the larva is on the move
     if (cmd.go) b.scanPhase += 2 * Math.PI * dt * b.tempo / GAIT.STROKE_S;
     const scan = cmd.go ? GAIT.SCAN * DEG * Math.sin(b.scanPhase) : 0;
-    // the head points a little toward the target, within its own limits;
-    // the turning itself is done by swinging the front round (below)
-    const steer = clamp(cmd.aim || 0, -GAIT.HEAD_STEER * DEG, GAIT.HEAD_STEER * DEG);
+    // The head does not steer: it sways left and right, scanning for carbon
+    // dioxide and taking any collision first. The turning is done by swinging
+    // the front round (below), so the larva follows its middle, not its head.
+    const steer = 0;
     // on the back the whole body is a C: the head follows the tail's side
     const cBend = P.legs === 0 ? GAIT.BACK_C * b.beta : 0;
     const want = b.clampHead(steer + scan + cBend);
@@ -337,7 +331,7 @@ const SkillBench = {
         // numbers go in the detail line; the reason changes only when the situation does
         const deg = Math.abs(off) / DEG;
         const side = body.sideWord(off > 0 ? 1 : -1);
-        const reason = deg < 10 ? 'target straight ahead — head pointing at it'
+        const reason = deg < 10 ? 'target straight ahead — head swaying, scanning'
           : 'target off toward ' + side + ' — swinging the front round between pushes';
         return { action: 'CRAWLING TO TARGET', reason,
           detail: 'target ' + dist.toFixed(1) + ' cm, ' + deg.toFixed(0) + '° off the body axis · ' + detail };
@@ -795,7 +789,7 @@ if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
         ['tail on the back', 'bent to one side ' + GAIT.SWEEP_BACK + '°, pushes on the floor down to ' + GAIT.BACK_MIN + '°, lifts, bends again; ' + GAIT.BOUT_MIN + '–' + GAIT.BOUT_MAX + ' strokes one side, then the other (video)'],
         ['roll over the back', 'curled ' + ROLL.CURL + '° toward the legs → straightens, tail up ' + ROLL.TAIL_UP + '° → back → other side → curls up, tail up ' + ROLL.TAIL_UP + '°; ' + (ROLL.STRAIGHTEN + ROLL.ROLL + ROLL.CURL_S) + ' s, on the spot'],
         ['head on the back', 'bends to the tail\'s side by ' + Math.round(GAIT.BACK_C * 100) + '% of the tail\'s bend: the body is a C'],
-        ['turning', 'head points within ±' + GAIT.HEAD_STEER + '° toward the target; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s, on a side and on the back'],
+        ['turning', 'the body follows its middle; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s; the head only sways ±' + GAIT.SCAN + '°, scanning'],
         ['head', 'held up ' + GAIT.HEAD_LIFT + '° off the ground, sweeping ±' + GAIT.SCAN + '° once a stroke']
       ];
       box.innerHTML = '<details><summary>Body</summary><table class="bench-table">' +
