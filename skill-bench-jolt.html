@@ -1,0 +1,1801 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light only">
+<title>LARVAE — skill bench on Jolt</title>
+<style>
+  :root { color-scheme: light; }
+  /* forced dark mode repaints background-color, not background-image;
+     -webkit-text-fill-color survives its text pass */
+  html, body {
+    margin: 0; padding: 0;
+    background-color: #fff; background-image: linear-gradient(#fff, #fff);
+    color: #000; -webkit-text-fill-color: #000;
+    font-family: Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.45;
+    -webkit-text-size-adjust: 100%;
+  }
+  div, span, label, p, td, th, h1, h2 { -webkit-text-fill-color: inherit; }
+  .bench-table { border-collapse: collapse; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; }
+  .bench-table td, .bench-table th { border-bottom: 1px solid #ddd; padding: 2px 10px 2px 0; text-align: left; }
+  .bench-table th { font-weight: bold; border-bottom: 1px solid #000; }
+  details summary { cursor: pointer; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+</style>
+<script src="harness.js"></script>
+<script src="physics.js"></script>
+</head>
+<body>
+<div id="bench-host"></div>
+
+<script>
+/* ============================================================
+   SKILL BENCH — one larva, one body skill at a time, pure geometry.
+   No forces, no senses, no behaviour rules: the observer sets the
+   target, the body shows whether it can do the skill.
+   Units: centimetres and seconds; the world's y axis points up.
+   ============================================================ */
+
+const DEG = Math.PI / 180;
+const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const smooth = x => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); };
+
+/* ---------------- BODY: three sausages ----------------
+   tail and middle soft, head hard. The legs (three pairs, on the
+   middle) and the jaws are not drawn. The joints are under a sleeve,
+   so nothing can get caught in them. */
+const BODY = {
+  TAIL_LEN: 1.5,  TAIL_D: 0.7,   // tail, 0.49 g
+  MID_LEN: 1.0,   MID_D: 0.6,    // middle with the legs, 0.23 g
+  HEAD_D: 0.5,                   // head, 0.07 g
+  ANCHOR: 0.75                   // the tail bears on the ground at its centre
+};
+/* Under a glass the soft tail is pressed flat to the middle's height, so the
+   larva bears the glass on tail and middle alike and the glass lies level.
+   The tail keeps its cross-section: lower, so wider. body.flat: 0 round, 1 flat. */
+const GLASS_REST = BODY.MID_D;                                  // cm: underside of a glass lying on the larva
+function tailHalfH(body) { return BODY.TAIL_D / 2 + ((GLASS_REST - BODY.TAIL_D) / 2) * (body.flat || 0); }
+// under a glass the hard head is held lower, so its top is no higher than the
+// middle's back: the glass lies on the back, not on the head (still off the ground)
+const HEAD_LIFT_UNDER = Math.asin((GLASS_REST - BODY.MID_D / 2 - BODY.HEAD_D / 2) / (BODY.HEAD_D / 2));
+// height of the head's centre above the floor
+function headZ(body) { return BODY.MID_D / 2 + BODY.HEAD_D / 2 * Math.sin(body.headLift); }
+function tailHalfW(body) { return BODY.TAIL_D / 2 + (BODY.TAIL_D * BODY.TAIL_D / GLASS_REST - BODY.TAIL_D) / 2 * (body.flat || 0); }
+
+/* ---------------- BODY: joints ----------------
+   Both joints are the same and bend the same way in every direction.
+   The one number is the least that allows every pose on the list:
+   the hook (drawing: tail folded about 110° to the middle). */
+const JOINT = {
+  BEND: 120,    // tail–middle, deg, any direction: toward the legs, the back, either side, up
+  TWIST: 90,    // deg: fore-body twisted under itself legs first; rolling over the back
+  // The head is not the tail: it bends a little toward the chest, where the
+  // legs are, and only just tilts back toward the back. On the back the same
+  // two limits are its left and right.
+  HEAD_LEGS: 40,   // deg, toward the chest / legs
+  HEAD_BACK: 10    // deg, toward the back
+};
+
+/* ---------------- BODY: gait (measured from video) ---------------- */
+const GAIT = {
+  STROKE_S: 2.0,       // one tail stroke, seconds
+  STEP: 0.24,          // ground gained per stroke, cm
+  SWEEP_SIDE: 75,      // on a side: tail curled toward the legs, every stroke, deg (measured)
+  // On the back (from the video, 39–59 s, measured at 10 frames a second): the
+  // body bends like a C to one side and pumps there between about 20° and 45°
+  // once a stroke, for about four strokes, then goes over to the other side.
+  SWEEP_BACK: 35,      // tail–middle bend at the start of a push, deg
+  BACK_MIN: 15,        // ...and at its end: the tail does not straighten fully, deg
+  BACK_C: 0.3,         // the head bends to the same side as the tail, by this share
+  BOUT_MIN: 3, BOUT_MAX: 5,   // strokes to one side before going over to the other
+  LIFT: 20,            // tail lift while it swings, deg
+  HEAD_LIFT: 30,       // the head is held up off the ground, never laid on it, deg
+  SCAN: 12,            // the head sways side to side, scanning, ± deg, once a stroke
+  FRONT_SWING: 30,     // between pushes the front swings round at most this fast, deg/s
+  TEMPO_SPREAD: 0.15,  // individual tempo ±15 %
+  HEAD_RATE: 40        // the head turns smoothly, at most this fast, deg/s
+};
+
+// Which way the legs face, as seen from above: +1 = right of the heading,
+// -1 = left, 0 = up (lying on the back). This changes only what is drawn
+// and the words used; the joints are the same whichever side is down.
+const POSTURES = {
+  left:  { label: 'left side',  legs: +1 },
+  right: { label: 'right side', legs: -1 },
+  back:  { label: 'back',       legs: 0 }
+};
+
+function makeBody(posture, rnd) {
+  const P = POSTURES[posture];
+  const BEND = JOINT.BEND * DEG;
+  const b = {
+    posture, label: P.label, legs: P.legs,
+    // roll about the long axis: 0 = on the left side, 90° = on the back, 180° = on the right side
+    rho: (posture === 'left' ? 0 : posture === 'back' ? 90 : 180) * DEG,
+    x: 0, y: 0, psi: 0,      // the tail–middle joint, and the heading of the middle
+    beta: 0,                 // tail–middle bend in the floor plane, + = tail to the right
+    lam: 0,                  // tail lift off the floor
+    delta: 0,                // middle–head bend in the floor plane, + = head to the right
+    tempo: 1 + rnd.range(-GAIT.TEMPO_SPREAD, GAIT.TEMPO_SPREAD),
+    nextSign: rnd.sign(), scanPhase: rnd.range(0, 2 * Math.PI), bout: 0, rndBout: rnd,
+    headLift: GAIT.HEAD_LIFT * DEG,
+    inStroke: false, f: 0, sign: 1, betaS: 0, betaE: 0, lamE: 0, pushed: 0,
+    recoverStarted: false, halted: false, pushing: false, phase: 'still', travelled: 0,
+    BEND
+  };
+
+  b.u = () => ({ x: Math.cos(b.psi), y: Math.sin(b.psi) });
+  b.tailDir = () => ({ x: Math.cos(b.psi + Math.PI + b.beta), y: Math.sin(b.psi + Math.PI + b.beta) });
+  b.headDir = () => ({ x: Math.cos(b.psi - b.delta), y: Math.sin(b.psi - b.delta) });
+  b.points = () => {
+    const u = b.u(), d = b.tailDir(), h = b.headDir(), c = Math.cos(b.lam);
+    const MH = { x: b.x + u.x * BODY.MID_LEN, y: b.y + u.y * BODY.MID_LEN };
+    return {
+      TM: { x: b.x, y: b.y }, MH,
+      // the head is tilted up, so seen from above it sits a little closer
+      head: { x: MH.x + h.x * BODY.HEAD_D / 2 * Math.cos(b.headLift), y: MH.y + h.y * BODY.HEAD_D / 2 * Math.cos(b.headLift) },
+      tailC: { x: b.x + d.x * BODY.ANCHOR * c, y: b.y + d.y * BODY.ANCHOR * c },
+      tailEnd: { x: b.x + d.x * BODY.TAIL_LEN * c, y: b.y + d.y * BODY.TAIL_LEN * c }
+    };
+  };
+
+  // The front advances along the middle's own axis. The tail's bend is set by
+  // the stroke itself: it is straightening on the floor while it pushes.
+  function slideFront(ds) {
+    // the body goes where the middle points; the head only scans, it does not lead
+    b.x += Math.cos(b.psi) * ds; b.y += Math.sin(b.psi) * ds;
+    b.travelled += ds;
+  }
+
+  // head limits in the floor plane, + = head to the right of the middle's axis
+  b.headLim = sgn => {
+    // on the back, left and right are sideways for the head: the chest limit both ways
+    if (P.legs === 0) return JOINT.HEAD_LEGS * DEG;
+    return (sgn === P.legs ? JOINT.HEAD_LEGS : JOINT.HEAD_BACK) * DEG;
+  };
+  b.clampHead = a => clamp(a, -b.headLim(-1), b.headLim(1));
+
+  // one tick. cmd = {go, aim}: aim is the wanted head bend, + = right
+  b.step = function (dt, cmd) {
+    // the head never rests: it sweeps side to side while the larva is on the move
+    if (cmd.go) b.scanPhase += 2 * Math.PI * dt * b.tempo / GAIT.STROKE_S;
+    const scan = cmd.go ? GAIT.SCAN * DEG * Math.sin(b.scanPhase) : 0;
+    // The head does not steer: it sways left and right, scanning for carbon
+    // dioxide and taking any collision first. The turning is done by swinging
+    // the front round (below), so the larva follows its middle, not its head.
+    const steer = 0;
+    // on the back the whole body is a C: the head follows the tail's side
+    const cBend = P.legs === 0 ? GAIT.BACK_C * b.beta : 0;
+    const want = b.clampHead(steer + scan + cBend);
+    const rate = GAIT.HEAD_RATE * DEG * dt;
+    b.delta += clamp(wrap(want - b.delta), -rate, rate);
+
+    // Between pushes the front is swung round toward the target, the whole body
+    // pivoting at the tail–middle joint. During a push the front goes straight.
+    const pushingNow = b.inStroke && !b.halted && b.f >= 0.45 && b.f < 0.95;
+    if (cmd.go && !pushingNow) {
+      const turn = clamp(cmd.aim || 0, -GAIT.FRONT_SWING * DEG * dt, GAIT.FRONT_SWING * DEG * dt);
+      b.psi = wrap(b.psi - turn);
+    }
+
+    if (!b.inStroke) {
+      b.pushing = false;
+      if (!cmd.go) { b.phase = 'still'; b.lam = P.legs === 0 ? GAIT.LIFT * DEG : 0; return; }
+      b.inStroke = true; b.f = 0; b.pushed = 0; b.halted = false;
+      // on a side the tail always curls toward the legs; on the back it alternates
+      if (P.legs !== 0) b.sign = P.legs;
+      else {
+        if (b.bout <= 0) {
+          b.sign = b.nextSign; b.nextSign = -b.nextSign;
+          b.bout = GAIT.BOUT_MIN + Math.floor(b.rndBout.next() * (GAIT.BOUT_MAX - GAIT.BOUT_MIN + 1));
+        }
+        b.bout--;
+      }
+      b.betaS = b.beta; b.lamS = b.lam;
+    }
+    // told to stop mid-stroke: the front stays where it is, the tail straightens
+    if (!cmd.go && !b.halted) { b.halted = true; b.betaH = b.beta; b.lamH = b.lam; b.fH = b.f; }
+    b.f += dt * b.tempo / GAIT.STROKE_S;
+    const f = b.f, L = GAIT.LIFT * DEG;
+    const target = b.sign * (P.legs !== 0 ? GAIT.SWEEP_SIDE : GAIT.SWEEP_BACK) * DEG;
+    b.pushing = false;
+
+    if (b.halted) {
+      const g = clamp((f - b.fH) / 0.2, 0, 1);
+      b.beta = b.betaH * (1 - smooth(g));
+      const restLam = P.legs === 0 ? L : 0;
+      b.lam = b.lamH + (restLam - b.lamH) * smooth(g);
+      b.phase = 'recover';
+      if (g >= 1) { b.inStroke = false; b.phase = 'still'; }
+      return;
+    }
+
+    // One stroke: the tail comes up, swings out bent, is laid on the floor at
+    // its widest bend, and pushes while it straightens on the floor. Straight
+    // again, it comes up for the next stroke.
+    if (f < 0.05) {                                     // lift
+      b.lam = b.lamS + (L - b.lamS) * smooth(f / 0.05);
+      b.phase = 'lift';
+    } else if (f < 0.38) {                              // swing out, in the air
+      b.lam = L;
+      b.beta = b.betaS + (target - b.betaS) * smooth((f - 0.05) / 0.33);
+      b.phase = 'swing';
+    } else if (f < 0.45) {                              // laid down at the widest bend
+      b.beta = target;
+      b.lam = L * (1 - smooth((f - 0.38) / 0.07));
+      b.phase = 'set';
+    } else {                                            // push: straightening on the floor
+      b.lam = 0;
+      const g = clamp((f - 0.45) / 0.50, 0, 1);
+      const end = P.legs !== 0 ? 0 : b.sign * GAIT.BACK_MIN * DEG;
+      b.beta = target + (end - target) * smooth(g);
+      const D = GAIT.STEP * (g - Math.sin(2 * Math.PI * g) / (2 * Math.PI));
+      if (D > b.pushed) { slideFront(D - b.pushed); b.pushed = D; }
+      b.phase = g < 1 ? 'push' : 'rest';
+      b.pushing = g < 1;
+    }
+    // the stroke ends where the push left the tail: straight on a side, still bent on the back
+    if (f >= 1) { if (P.legs !== 0) b.beta = 0; b.lam = 0; b.inStroke = false; b.phase = 'rest'; }
+  };
+
+  // words for a floor side (+1 = right of the heading), in the body's own terms
+  b.sideWord = s => P.legs === 0 ? (s > 0 ? 'its left' : 'its right') : (s === P.legs ? 'the legs' : 'the back');
+
+  b.describe = function () {
+    switch (b.phase) {
+      case 'still': return 'lying still';
+      case 'rest': return 'tail straight on the floor';
+      case 'lift': return 'tail coming up off the floor';
+      case 'swing': return 'tail lifted, swinging toward ' + b.sideWord(b.sign);
+      case 'set': return 'tail laid on the floor at its widest bend';
+      case 'push': return 'tail straightening on the floor, pushing the front forward ' + (b.pushed * 10).toFixed(1) + ' of ' + (GAIT.STEP * 10).toFixed(1) + ' mm';
+      case 'recover': return 'stopping — tail straightening';
+    }
+    return '';
+  };
+  return b;
+}
+
+/* ---------------- WORLD + the simulation the harness runs ---------------- */
+const ARENA = { W: 32, H: 20 };   // a bare test floor, cm
+const PX = 40;                     // px per cm: 0.5 mm = 2 px
+const TARGET_R = 0.3;
+const MAX_TIME = 900;              // s
+
+const SKILLS = [
+  { value: 'crawl-left',  label: 'Crawl to target on the left side',  posture: 'left' },
+  { value: 'crawl-right', label: 'Crawl to target on the right side', posture: 'right' },
+  { value: 'crawl-back',  label: 'Crawl to target on the back',       posture: 'back' },
+  { value: 'roll-lr', label: 'Roll from the left side to the right, over the back', kind: 'roll', from: 'left', to: 'right' },
+  { value: 'roll-rl', label: 'Roll from the right side to the left, over the back', kind: 'roll', from: 'right', to: 'left' },
+  { value: 'ring-l',  label: 'On the left side: crawl round a ring, push things out', kind: 'ring', posture: 'left' },
+  { value: 'ring-r',  label: 'On the right side: crawl round a ring, push things out', kind: 'ring', posture: 'right' },
+  { value: 'tail-l',  label: 'On the left side: tail toward the legs, the back, up', kind: 'poses', posture: 'left' },
+  { value: 'tail-r',  label: 'On the right side: tail toward the legs, the back, up', kind: 'poses', posture: 'right' },
+  { value: 'fore-l',  label: 'On the left side: front twisted, legs down', kind: 'fore', posture: 'left' },
+  { value: 'fore-r',  label: 'On the right side: front twisted, legs down', kind: 'fore', posture: 'right' },
+  { value: 'glass',   label: 'Reference glass: lying on the floor', kind: 'glass', posture: 'left', where: 'floor' },
+  { value: 'glass-over', label: 'Two glasses: the larva tries them on, keeps the one that covers it', kind: 'glass-try', posture: 'left' },
+  { value: 'glass-under-l', label: 'On the left side: get under a glass on the floor and lift it', kind: 'glass-under', posture: 'left' },
+  { value: 'glass-under-r', label: 'On the right side: get under a glass on the floor and lift it', kind: 'glass-under', posture: 'right' }
+];
+
+const SCHEMA = [
+  { key: 'skill', label: 'Skill', type: 'select', value: 'crawl-left', options: SKILLS },
+  { key: 'distance', label: 'Target distance', type: 'number', min: 3, max: 12, step: 0.5, value: 8, unit: 'cm',
+    hint: 'Where the target starts, in any direction, behind included. Click the floor to move it.' },
+  { key: 'curl', label: 'Roll: starting curl', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
+    hint: 'How far the tail is bent toward the legs before the roll. Any bend works: it straightens out first.' },
+  { key: 'toLegs', label: 'Tail poses: toward the legs', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
+    hint: 'Tail–middle bend toward the legs, along the floor. 110° is the hook in your drawing.' },
+  { key: 'toBack', label: 'Tail poses: toward the back', type: 'number', min: 0, max: 120, step: 5, value: 30, unit: '°',
+    hint: 'Tail–middle bend toward the back, along the floor.' },
+  { key: 'up', label: 'Tail poses: up off the bowl', type: 'number', min: 0, max: 120, step: 5, value: 45, unit: '°',
+    hint: 'Tail lifted off the floor, lying on a side.' },
+  { key: 'foreCurl', label: 'Front twist: tail bend before', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
+    hint: 'Tail bent toward the legs as the larva lies on its side before the twist.' },
+  { key: 'foreEase', label: 'Front twist: tail unbends by', type: 'number', min: 0, max: 60, step: 5, value: 30, unit: '°',
+    hint: 'While the front turns legs down, the tail straightens a little by this much.' },
+  { key: 'ringTail', label: 'Ring: curl', type: 'number', min: 70, max: 105, step: 5, value: 105, unit: '°',
+    hint: 'Tail bent toward the legs. The ring is the circle the curled body lies on, as in your drawing: the tighter the curl, the smaller the ring. Up to 105°: each stroke curls the tail 15° further, and the joint stops at 120°.' },
+  { key: 'firstGlass', label: 'Glasses: give first', type: 'select', value: 'small',
+    options: [{ value: 'small', label: 'the small one' }, { value: 'normal', label: 'the normal one' }],
+    hint: 'Which glass you put on the larva\'s back at Пуск. The other lies on the floor nearby.' },
+  { key: 'underLie', label: 'Under the glass, lies on', type: 'select', value: 'side',
+    options: [{ value: 'side', label: 'its side' }, { value: 'back', label: 'its back' }],
+    hint: 'Once its legs have pushed it in under the glass, it lies down there on its side or rolls onto its back.' }
+];
+
+/* ---------------- PHYSICS under every skill ----------------
+   The skills move the skeleton; the solver (physics.js, Jolt) carries the
+   elastic skin, the hard head, the floor and everything else, and keeps every
+   body out of every other. One world at a time. */
+let WORLD = null;
+const PEN_MAX = 0.06;     // cm: deeper than 0.6 mm (2–3 px on screen) for PEN_TICKS steps running counts as one body inside another
+const PEN_TICKS = 4;      // steps (0.13 s)
+const PEN_HARD = 0.15;    // cm: deeper than 1.5 mm counts at once
+const PEN_YIELD = 0.03;   // cm: pressed this deep, the body stops pushing for the moment
+function spineOf(body, larva) {
+  const p = body.points(), u = body.u(), td = body.tailDir(), TL = BODY.TAIL_LEN, cl = Math.cos(body.lam), sl = Math.sin(body.lam);
+  const raw = s => {
+    if (s <= TL) { const d = TL - s; return { x: p.TM.x + td.x * d * cl, y: p.TM.y + td.y * d * cl, lift: d * sl }; }
+    return { x: p.TM.x + u.x * (s - TL), y: p.TM.y + u.y * (s - TL), lift: 0 };
+  };
+  const b = 0.25;                                 // the joint is rounded over ±2.5 mm
+  return s => {
+    let q, dq;
+    if (Math.abs(s - TL) < b) {
+      const A = raw(TL - b), C = raw(TL + b), t = (s - (TL - b)) / (2 * b), M = { x: p.TM.x, y: p.TM.y, lift: 0 };
+      q = { x: (1 - t) * (1 - t) * A.x + 2 * t * (1 - t) * M.x + t * t * C.x, y: (1 - t) * (1 - t) * A.y + 2 * t * (1 - t) * M.y + t * t * C.y,
+            lift: (1 - t) * (1 - t) * A.lift };
+      dq = { x: 2 * (1 - t) * (M.x - A.x) + 2 * t * (C.x - M.x), y: 2 * (1 - t) * (M.y - A.y) + 2 * t * (C.y - M.y), z: -2 * (1 - t) * A.lift };
+    } else {
+      q = raw(s);
+      dq = s < TL ? { x: -td.x * cl, y: -td.y * cl, z: -sl } : { x: u.x, y: u.y, z: 0 };
+    }
+    const zr = larva.radius(s);     // the part of the height that is only the body's thickness, not its slope
+    return { x: q.x, y: q.y, z: zr + q.lift, zr, dx: dq.x, dy: dq.y, dz: dq.z };
+  };
+}
+function headOf(body) { const p = body.points(); return { x: p.head.x, y: p.head.y, z: headZ(body) }; }
+function attachPhysics(body) {
+  if (typeof Physics === 'undefined' || !Physics.ready) return null;
+  if (WORLD) { try { WORLD.destroy(); } catch (e) { /* already gone */ } }
+  WORLD = Physics.createWorld();
+  const world = WORLD, larva = world.addLarva(BODY);
+  const ph = {
+    world, larva,
+    pose(dt) { world.setPose(larva, spineOf(body, larva), headOf(body), dt, body.rho); },
+    sync(dt) { ph.pose(dt); world.step(dt); },
+    held: false, heldBy: '',
+    feel() { const p = world.penetration(); ph.held = p.depth > PEN_YIELD; ph.heldBy = p.what; }
+  };
+  ph.pose(Harness.DT);
+  body.phys = ph;
+  return ph;
+}
+
+const SkillBench = {
+  create(params, rng) {
+    const sim = createSkill(params, rng);
+    // every skill runs on the solver; the glass skills drive it themselves
+    if (sim.body) {
+      const ph = sim.body.phys || attachPhysics(sim.body);
+      if (ph && !sim.selfSync) {
+        // the body feels it when it presses into something it cannot shift: the
+        // skill then holds still for that tick, and the solver pushes things apart
+        const step = sim.step.bind(sim);
+        sim.step = dt => { if (!ph.held || (sim.keepWorking && sim.keepWorking())) step(dt); ph.sync(dt); ph.feel(); };
+        const status = sim.status.bind(sim);
+        sim.status = () => { const st = status(); if (ph.held) st.detail = (st.detail ? st.detail + ' · ' : '') + 'held back: ' + ph.heldBy; return st; };
+      }
+    }
+    // one guard for every skill: no body inside another
+    if (sim.body && sim.body.phys) {
+      const snap = sim.snapshot.bind(sim);
+      // the solver needs a few steps to part things that hit each other fast: a
+      // body inside another counts if it is deeper than PEN_MAX for PEN_TICKS steps
+      // running, or ever deeper than PEN_HARD
+      let deepFor = 0;
+      sim.snapshot = () => { const s = snap(), p = sim.body.phys.world.penetration(); s.pen = +p.depth.toFixed(4); s.penWhat = p.what;
+        if (!s.skipChecks) deepFor = s.pen > PEN_MAX ? deepFor + 1 : 0; s.deepFor = deepFor; return s; };
+      sim.invariants = (sim.invariants || []).concat([{ name: 'body in body',
+        check: (a, b) => (b.pen > PEN_HARD || b.deepFor >= PEN_TICKS) ? b.penWhat + ', ' + (b.pen * 10).toFixed(2) + ' mm deep' + (b.deepFor >= PEN_TICKS ? ' for ' + b.deepFor + ' steps' : '') : null }]);
+    }
+    return sim;
+  },
+  drawEmpty(ctx, W, H) { drawFloor(ctx, W, H); }
+};
+
+function createSkill(params, rng) {
+  {
+    const skill = SKILLS.find(s => s.value === params.skill);
+    if (skill.kind === 'roll') return createRoll(skill, rng, params.curl);
+    if (skill.kind === 'poses') return createPoses(skill, rng, params);
+    if (skill.kind === 'fore') return createFore(skill, rng, params);
+    if (skill.kind === 'ring') return createRing(skill, rng, params);
+    if (skill.kind === 'glass') return createGlassBench(skill, rng, params);
+    if (skill.kind === 'glass-try') return createGlassTry(skill, rng, params);
+    if (skill.kind === 'glass-under') return createGlassUnder(skill, rng, params);
+    const rL = rng('larva'), rT = rng('target');
+    const body = makeBody(skill.posture, rL);
+    body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+    body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+    body.psi = rL.range(-Math.PI, Math.PI);
+    let target = null;
+    for (let i = 0; i < 400 && !target; i++) {
+      const a = rT.range(-Math.PI, Math.PI);
+      const t = { x: body.x + Math.cos(a) * params.distance, y: body.y + Math.sin(a) * params.distance };
+      if (t.x > 2 && t.x < ARENA.W - 2 && t.y > 2 && t.y < ARENA.H - 2) target = t;
+    }
+    if (!target) target = { x: ARENA.W - 3, y: ARENA.H / 2 };
+
+    let cmd = { go: true, aim: 0 }, arrived = false, arrivedFor = 0, userMoved = false, drag = null;
+    let off = 0, dist = 0;
+    const trail = [];
+    let tickN = 0;
+
+    // where the target lies, seen from the front end: distance, and the
+    // angle off the middle's axis (+ = right). This is the skill's command.
+    function measure() {
+      const p = body.points();
+      dist = Math.hypot(target.x - p.head.x, target.y - p.head.y);
+      off = -wrap(Math.atan2(target.y - p.MH.y, target.x - p.MH.x) - body.psi);
+      if (dist < TARGET_R + BODY.HEAD_D / 2) arrived = true;
+    }
+
+    const sim = {
+      step(dt) {
+        tickN++;
+        measure();
+        cmd = arrived ? { go: false, aim: body.delta } : { go: true, aim: off };
+        body.step(dt, cmd);
+        if (arrived && !body.inStroke) arrivedFor += dt; else arrivedFor = 0;
+        if (tickN % 3 === 0) { trail.push(body.points().head); if (trail.length > 3000) trail.shift(); }
+      },
+      status() {
+        const detail = 'on its ' + body.label + ' · ' + body.describe() + ' · crawled ' + body.travelled.toFixed(1) + ' cm';
+        if (arrived) return { action: 'AT TARGET', reason: 'head against the target — stopped', detail };
+        // numbers go in the detail line; the reason changes only when the situation does
+        const deg = Math.abs(off) / DEG;
+        const side = body.sideWord(off > 0 ? 1 : -1);
+        const reason = deg < 10 ? 'target straight ahead — head swaying, scanning'
+          : 'target off toward ' + side + ' — swinging the front round between pushes';
+        return { action: 'CRAWLING TO TARGET', reason,
+          detail: 'target ' + dist.toFixed(1) + ' cm, ' + deg.toFixed(0) + '° off the body axis · ' + detail };
+      },
+      done() {
+        if (arrivedFor >= 1.5) return { ok: true, why: 'reached the target' };
+        if (tickN * Harness.DT > MAX_TIME) return { ok: false, why: 'did not reach the target in ' + MAX_TIME + ' s' };
+        return null;
+      },
+      snapshot() {
+        const p = body.points();
+        const s = {
+          x: body.x, y: body.y, psi: body.psi,
+          beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: +body.delta.toFixed(5),
+          head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) },
+          tailC: { x: p.tailC.x, y: p.tailC.y }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+          phase: body.phase, pushing: body.pushing, arrived,
+          target: { x: +target.x.toFixed(3), y: +target.y.toFixed(3) },
+          skipChecks: userMoved
+        };
+        userMoved = false;
+        return s;
+      },
+      invariants: [
+        { name: 'jump', check: (a, b) => {
+          const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
+          return d > 0.05 ? 'head moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } },
+        { name: 'fan', check: (a, b) => {
+          const w = Math.abs(wrap(b.psi - a.psi)) / Harness.DT / DEG;
+          return w > 90 ? 'body turned at ' + w.toFixed(0) + '°/s' : null; } },
+        { name: 'joints', check: (a, b) => {
+          const lim = JOINT.BEND * DEG + 0.5 * DEG;
+          if (Math.abs(b.beta) > lim) return 'tail–middle bent ' + (Math.abs(b.beta) / DEG).toFixed(1) + '°, the joint allows ' + JOINT.BEND + '°';
+          const hl = body.headLim(b.delta >= 0 ? 1 : -1) + 0.5 * DEG;
+          if (Math.abs(b.delta) > hl) return 'head bent ' + (Math.abs(b.delta) / DEG).toFixed(1) + '°, it bends at most ' + Math.round((hl / DEG) - 0.5) + '° that way';
+          if (b.lam < -1e-9 || b.lam > lim) return 'tail lift ' + (b.lam / DEG).toFixed(1) + '° out of range';
+          return null; } },
+        { name: 'ground law', check: (a, b) => {
+          if (!(a.pushing && b.pushing)) return null;
+          // the back end of the middle slides only along the middle
+          const u = { x: Math.cos(b.psi), y: Math.sin(b.psi) };
+          const q = Math.abs(-(b.x - a.x) * u.y + (b.y - a.y) * u.x);
+          return q > 2e-4 ? 'middle slid sideways ' + (q * 10).toFixed(3) + ' mm' : null; } },
+        { name: 'floor', check: (a, b) => {
+          for (const p of [b.head, b.tailEnd, { x: b.x, y: b.y }])
+            if (p.x < 0 || p.y < 0 || p.x > ARENA.W || p.y > ARENA.H) return 'body left the test floor';
+          return null; } }
+      ],
+
+      pointer(kind, px, py, extra) {
+        const w = { x: px / PX, y: ARENA.H - py / PX };
+        const pts = body.points();
+        const near = [pts.TM, pts.MH, pts.head, pts.tailC, pts.tailEnd].some(p => Math.hypot(p.x - w.x, p.y - w.y) < 0.6);
+        if (kind === 'down') {
+          if (near) drag = { dx: body.x - w.x, dy: body.y - w.y };
+          else if (w.x > 0.5 && w.x < ARENA.W - 0.5 && w.y > 0.5 && w.y < ARENA.H - 0.5) {
+            target.x = w.x; target.y = w.y; arrived = false;
+          }
+          return true;
+        }
+        if (kind === 'move' && drag) {
+          body.x = clamp(w.x + drag.dx, 2, ARENA.W - 2); body.y = clamp(w.y + drag.dy, 2, ARENA.H - 2);
+          userMoved = true; arrived = false; trail.length = 0; return true;
+        }
+        if (kind === 'up') { drag = null; return true; }
+        if (kind === 'wheel' && near) {
+          body.psi = wrap(body.psi + extra.delta * 5 * DEG); userMoved = true; arrived = false; return true;
+        }
+        return false;
+      },
+
+      draw(ctx, W, H) { drawScene(ctx, W, H, body, target, trail); }
+    };
+    sim.body = body; sim.target = target;
+    return sim;
+  }
+}
+
+
+
+/* ---------------- ROLL over the back ----------------
+   As described: lying on a side, curled toward the legs; it straightens out,
+   holding the tail up a little so the tail does not push it; rolls onto the
+   back, then onto the other side; holds the tail up a little again and curls
+   up like a shrimp. On the spot: nothing pushes, so nothing moves. */
+const ROLL = {
+  CURL: 110,       // curled pose toward the legs, deg (the hook in the drawing)
+  TAIL_UP: 10,     // tail held up a little while straightening and curling, deg
+  HOLD: 1.0, STRAIGHTEN: 1.0, ROLL: 2.0, CURL_S: 1.0   // s
+};
+
+function createRoll(skill, rng, startCurl) {
+  const rL = rng('larva');
+  const body = makeBody(skill.from, rL);
+  body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+  body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+  body.psi = rL.range(-Math.PI, Math.PI);
+  const legsFrom = POSTURES[skill.from].legs, legsTo = POSTURES[skill.to].legs;
+  const rho0 = body.rho, rho1 = (skill.to === 'left' ? 0 : 180) * DEG;
+  const C = ROLL.CURL * DEG, U = ROLL.TAIL_UP * DEG;
+  const C0 = (startCurl === undefined ? ROLL.CURL : startCurl) * DEG;
+  body.beta = legsFrom * C0;
+  const t1 = ROLL.HOLD, t2 = t1 + ROLL.STRAIGHTEN, t3 = t2 + ROLL.ROLL, t4 = t3 + ROLL.CURL_S, t5 = t4 + ROLL.HOLD;
+  const start = { x: body.x, y: body.y };
+  let t = 0, phase = 'curled';
+  const bump = g => Math.sin(Math.PI * clamp(g, 0, 1));   // up and back down
+
+  function pose() {
+    if (t < t1) { phase = 'curled'; body.beta = legsFrom * C0; body.lam = 0; }
+    else if (t < t2) { const g = (t - t1) / ROLL.STRAIGHTEN; phase = 'straighten'; body.beta = legsFrom * C0 * (1 - smooth(g)); body.lam = U * bump(g); }
+    else if (t < t3) { const g = (t - t2) / ROLL.ROLL; phase = g < 0.5 ? 'to-back' : 'to-side'; body.beta = 0; body.lam = 0; body.rho = rho0 + (rho1 - rho0) * smooth(g); }
+    else if (t < t4) { const g = (t - t3) / ROLL.CURL_S; phase = 'curl'; body.rho = rho1; body.beta = legsTo * C * smooth(g); body.lam = U * bump(g); }
+    else { phase = 'done'; body.rho = rho1; body.beta = legsTo * C; body.lam = 0; }
+    const c = Math.cos(body.rho);
+    body.legs = Math.abs(c) > 0.7 ? Math.sign(c) : 0;
+    body.label = Math.abs(c) > 0.7 ? (c > 0 ? 'left side' : 'right side') : 'back';
+    body.delta = 0;
+  }
+  pose();
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; pose(); },
+    status() {
+      const deg = Math.round(body.rho / DEG);
+      const from = POSTURES[skill.from].label, to = POSTURES[skill.to].label;
+      const detail = 'rolled ' + Math.abs(Math.round((body.rho - rho0) / DEG)) + '° of 180° · tail bent ' +
+        Math.abs(Math.round(body.beta / DEG)) + '°, lifted ' + Math.round(body.lam / DEG) + '°';
+      switch (phase) {
+        case 'curled': return { action: 'CURLED ON THE ' + from.toUpperCase(), reason: 'lying curled toward the legs', detail };
+        case 'straighten': return { action: 'STRAIGHTENING', reason: 'tail held up a little so it does not push', detail };
+        case 'to-back': return { action: 'ROLLING ONTO THE BACK', reason: 'turning over through the back, on the spot', detail };
+        case 'to-side': return { action: 'ROLLING ONTO THE ' + to.toUpperCase(), reason: 'coming down on the other side', detail };
+        case 'curl': return { action: 'CURLING UP', reason: 'tail held up a little so it does not push', detail };
+      }
+      return { action: 'CURLED ON THE ' + to.toUpperCase(), reason: 'turned over and curled up like a shrimp', detail };
+    },
+    done() { return t >= t5 ? { ok: true, why: 'rolled over through the back, on the spot' } : null; },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5),
+        delta: 0, rho: +body.rho.toFixed(5), head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) },
+        tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) }, phase, pushing: false, skipChecks: false };
+    },
+    invariants: [
+      { name: 'joints', check: (a, b) => Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG ? 'tail–middle bent past ' + JOINT.BEND + '°' : null },
+      { name: 'over the back', check: (a, b) => Math.sin(b.rho) < -1e-6 ? 'rolled through the belly' : null },
+      { name: 'on the spot', check: (a, b) => {
+        const d = Math.hypot(b.x - start.x, b.y - start.y);
+        return d > 0.01 ? 'body moved ' + (d * 10).toFixed(1) + ' mm along the floor' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
+        return d > 0.05 ? 'head moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
+  };
+}
+
+
+/* ---------------- TAIL POSES on a side ----------------
+   Lying on a side, on the spot: the tail goes toward the legs and back to
+   straight, toward the back and back to straight, then up off the floor and
+   back down. Along the floor the bend is in the floor plane; "up" lifts the
+   tail out of it. The three angles are the observer's to set. */
+const POSE_T = { RATE: 60, MIN_MOVE: 0.5, HOLD: 1.0 };   // tail moves at about 60°/s on average; holds 1 s
+
+function createPoses(skill, rng, params) {
+  const rL = rng('larva');
+  const body = makeBody(skill.posture, rL);
+  body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+  body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+  body.psi = rL.range(-Math.PI, Math.PI);
+  const legs = POSTURES[skill.posture].legs;
+  const steps = [
+    { name: 'toward the legs', beta: legs * params.toLegs * DEG, lam: 0 },
+    { name: 'toward the back', beta: -legs * params.toBack * DEG, lam: 0 },
+    { name: 'up off the bowl', beta: 0, lam: params.up * DEG }
+  ];
+  // each pose takes as long as its angle needs, so the tail never jerks
+  for (const st of steps) {
+    st.move = Math.max(POSE_T.MIN_MOVE, Math.max(Math.abs(st.beta), st.lam) / DEG / POSE_T.RATE);
+    st.len = 2 * st.move + POSE_T.HOLD;
+  }
+  const total = steps.reduce((a, st) => a + st.len, 0) + POSE_T.HOLD;
+  const start = { x: body.x, y: body.y };
+  let t = 0, phase = 'straight', cur = null;
+
+  function pose() {
+    let k = 0, u = t;
+    while (k < steps.length && u >= steps[k].len) { u -= steps[k].len; k++; }
+    if (k >= steps.length) { phase = 'done'; body.beta = 0; body.lam = 0; cur = null; return; }
+    cur = steps[k];
+    const M = cur.move;
+    let a;
+    if (u < M) { a = smooth(u / M); phase = 'out'; }
+    else if (u < M + POSE_T.HOLD) { a = 1; phase = 'hold'; }
+    else { a = 1 - smooth((u - M - POSE_T.HOLD) / M); phase = 'back'; }
+    body.beta = cur.beta * a; body.lam = cur.lam * a; body.delta = 0;
+  }
+  pose();
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; pose(); },
+    status() {
+      const detail = 'on its ' + body.label + ' · tail bent ' + Math.abs(Math.round(body.beta / DEG)) + '° along the floor, lifted ' + Math.round(body.lam / DEG) + '°';
+      if (!cur) return { action: 'TAIL STRAIGHT', reason: 'all three poses done', detail };
+      const what = 'TAIL ' + cur.name.toUpperCase();
+      if (phase === 'out') return { action: what, reason: 'moving the tail into the pose, on the spot', detail };
+      if (phase === 'hold') return { action: what, reason: 'holding the pose', detail };
+      return { action: 'TAIL STRAIGHTENING', reason: 'back from ' + cur.name, detail };
+    },
+    done() { return t >= total ? { ok: true, why: 'took all three tail poses, on the spot' } : null; },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: 0,
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+        phase, pose: cur ? cur.name : 'straight', pushing: false, skipChecks: false };
+    },
+    invariants: [
+      { name: 'joints', check: (a, b) => (Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG || b.lam > JOINT.BEND * DEG + 0.5 * DEG || b.lam < -1e-9)
+        ? 'tail past the joint limit of ' + JOINT.BEND + '°' : null },
+      { name: 'on the spot', check: (a, b) => {
+        const d = Math.hypot(b.x - start.x, b.y - start.y);
+        return d > 0.01 ? 'body moved ' + (d * 10).toFixed(1) + ' mm along the floor' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.tailEnd.x - a.tailEnd.x, b.tailEnd.y - a.tailEnd.y);
+        return d > 0.15 ? 'tail tip moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
+  };
+}
+
+
+/* ---------------- FRONT TWISTED, LEGS DOWN, on a side ----------------
+   As described: lying on a side, the head and the middle turn together about
+   the body's long axis by 90°, until the legs face down into the floor; while
+   they turn, the tail straightens a little. The whole body stays at floor
+   level. This is the in-between pose for going down a slope; the tilt down
+   that follows needs a slope and comes later. The tail stays on its side. */
+const FORE = { HOLD: 1.0, TWIST_S: 1.5, KEEP: 2.0 };   // s
+
+function createFore(skill, rng, params) {
+  const rL = rng('larva');
+  const body = makeBody(skill.posture, rL);
+  body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+  body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+  body.psi = rL.range(-Math.PI, Math.PI);
+  const legs = POSTURES[skill.posture].legs;
+  const rhoSide = body.rho;                      // 0 on the left side, 180° on the right
+  const rhoDown = (skill.posture === 'left' ? -90 : 270) * DEG;   // legs into the floor
+  body.rhoTail = rhoSide;                        // the tail stays lying on its side
+  const curl = params.foreCurl * DEG, eased = Math.max(0, params.foreCurl - params.foreEase) * DEG;
+  const t1 = FORE.HOLD, t2 = t1 + FORE.TWIST_S, t3 = t2 + FORE.KEEP, t4 = t3 + FORE.TWIST_S, t5 = t4 + FORE.HOLD;
+  const start = { x: body.x, y: body.y };
+  let t = 0, phase = 'side';
+
+  function pose() {
+    let a;
+    if (t < t1) { a = 0; phase = 'side'; }
+    else if (t < t2) { a = smooth((t - t1) / FORE.TWIST_S); phase = 'twist'; }
+    else if (t < t3) { a = 1; phase = 'hold'; }
+    else if (t < t4) { a = 1 - smooth((t - t3) / FORE.TWIST_S); phase = 'untwist'; }
+    else { a = 0; phase = t < t5 ? 'back' : 'done'; }
+    body.rho = rhoSide + (rhoDown - rhoSide) * a;
+    body.beta = legs * (curl + (eased - curl) * a);
+    body.lam = 0; body.delta = 0;
+  }
+  pose();
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; pose(); },
+    status() {
+      const tw = Math.round(Math.abs(body.rho - rhoSide) / DEG);
+      const detail = 'on its ' + body.label + ' · front turned ' + tw + '° of 90° · tail bent ' + Math.abs(Math.round(body.beta / DEG)) + '° toward the legs';
+      switch (phase) {
+        case 'side': return { action: 'LYING ON THE SIDE', reason: 'curled toward the legs', detail };
+        case 'twist': return { action: 'TWISTING THE FRONT', reason: 'head and middle turning legs down, tail easing a little', detail };
+        case 'hold': return { action: 'FRONT TWISTED, LEGS DOWN', reason: 'the in-between pose for going down a slope', detail };
+        case 'untwist': return { action: 'TURNING THE FRONT BACK', reason: 'back onto the side, tail curling again', detail };
+      }
+      return { action: 'LYING ON THE SIDE', reason: 'front turned back', detail };
+    },
+    done() { return t >= t5 ? { ok: true, why: 'twisted the front legs down and back, on the spot' } : null; },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: 0, delta: 0,
+        rho: +body.rho.toFixed(5), rhoTail: body.rhoTail,
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+        phase, pushing: false, skipChecks: false };
+    },
+    invariants: [
+      { name: 'twist', check: (a, b) => Math.abs(b.rho - b.rhoTail) > JOINT.TWIST * DEG + 0.5 * DEG
+        ? 'front twisted ' + Math.round(Math.abs(b.rho - b.rhoTail) / DEG) + '° against the tail, the joint allows ' + JOINT.TWIST + '°' : null },
+      { name: 'joints', check: (a, b) => Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG ? 'tail–middle bent past ' + JOINT.BEND + '°' : null },
+      { name: 'on the spot', check: (a, b) => {
+        const d = Math.hypot(b.x - start.x, b.y - start.y);
+        return d > 0.01 ? 'body moved ' + (d * 10).toFixed(1) + ' mm along the floor' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.tailEnd.x - a.tailEnd.x, b.tailEnd.y - a.tailEnd.y);
+        return d > 0.15 ? 'tail tip moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
+  };
+}
+
+
+/* ---------------- RING: curled on a side, turning round its own curl ----------------
+   As in the drawing: lying on a side, curled toward the legs, the whole body
+   lies on one small imaginary circle (grey). It crawls round that circle with
+   its tail strokes, so the curl turns on the spot. What it meets it pushes out:
+   - a stone at the head: with the head and the legs;
+   - a stone at the tail: with the tail;
+   - something alive or shaking (another larva, glass another larva holds):
+     only with the head, the jaws and the legs. The tail is soft: it is lifted
+     away, and the larva crawls on round until its head comes to the thing. */
+const RING = {
+  SWING: 15,          // deg the tail curls further while it swings, in the air; it pushes while it eases back
+  LIFT: 10,           // deg the tail is lifted while it swings
+  GUARD: 15,          // deg the tail is held up when something alive is at it
+  PUSH: 0.15,         // cm/s an obstacle is pushed out
+  STONE_R: 0.3, LIVE_R: 0.45,
+  CREEP: 0.2,         // cm/s the other larva creeps in toward this one
+  SHAKE: 0.02,        // cm it shakes each tick
+  MAX_T: 900,
+  SHOVE: 900,         // g·cm/s²: how hard head-and-legs or the tail shove a thing outward (about 0.9 g-force)
+  LIVE_PRESS: 300     // g·cm/s²: the most the other larva presses in with (it creeps, shaking, at CREEP)
+};
+
+function createRing(skill, rng, params) {
+  const rL = rng('larva'), rO = rng('other');
+  const body = makeBody(skill.posture, rL);
+  const legs = POSTURES[skill.posture].legs;
+  const dir = -legs;                          // the way round: legs toward the centre
+  const bend = params.ringTail * DEG;
+  // the ring: the circle on which the middle (1 cm) and the tail (1.5 cm) are
+  // both chords, meeting at the tail–middle joint at the given bend
+  const chord = (c, r) => 2 * Math.asin(Math.min(1, c / (2 * r)));
+  let lo = 0.76, hi = 20;
+  for (let k = 0; k < 60; k++) { const m = (lo + hi) / 2; if ((chord(BODY.MID_LEN, m) + chord(BODY.TAIL_LEN, m)) / 2 > bend) lo = m; else hi = m; }
+  const R = (lo + hi) / 2, thM = chord(BODY.MID_LEN, R), thT = chord(BODY.TAIL_LEN, R);
+  const ringBeta = legs * (thM + thT) / 2;
+  const headBias = legs * thM / 2;            // the head carries on round the circle
+  const C = { x: ARENA.W / 2, y: ARENA.H / 2 };
+  let phi = rL.range(-Math.PI, Math.PI), done = 0;   // where the tail–middle joint is on the ring
+
+  function place() {
+    const TM = { x: C.x + R * Math.cos(phi), y: C.y + R * Math.sin(phi) };
+    const MH = { x: C.x + R * Math.cos(phi + dir * thM), y: C.y + R * Math.sin(phi + dir * thM) };
+    body.x = TM.x; body.y = TM.y; body.psi = Math.atan2(MH.y - TM.y, MH.x - TM.x);
+  }
+  place();
+  body.beta = ringBeta; body.lam = 0; body.delta = body.clampHead(headBias);
+
+  function parts() {
+    const p = body.points();
+    const mid = { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 };
+    return [
+      { name: 'head', a: p.head, b: p.head, r: BODY.HEAD_D / 2, up: 0 },
+      { name: 'front', a: mid, b: p.MH, r: BODY.MID_D / 2, up: 0 },
+      { name: 'back', a: p.TM, b: mid, r: BODY.MID_D / 2, up: 0 },
+      { name: 'tail', a: p.TM, b: p.tailEnd, r: BODY.TAIL_D / 2, up: body.lam }
+    ];
+  }
+  function segDist(q, a, b) {
+    const vx = b.x - a.x, vy = b.y - a.y, L2 = vx * vx + vy * vy;
+    const t = L2 ? clamp(((q.x - a.x) * vx + (q.y - a.y) * vy) / L2, 0, 1) : 0;
+    const cx = a.x + t * vx, cy = a.y + t * vy;
+    return { d: Math.hypot(q.x - cx, q.y - cy), p: { x: cx, y: cy } };
+  }
+  // a tail held up passes over stones on the floor, but not over another larva
+  function touch(o) {
+    let best = null;
+    for (const pt of parts()) {
+      if (pt.up > 5 * DEG && !o.live) continue;
+      const sd = segDist(o, pt.a, pt.b), gap = sd.d - pt.r - o.r;
+      if (!best || gap < best.gap) best = { part: pt.name, gap, at: sd.p };
+    }
+    return best;
+  }
+
+  // Objects: two stones in the gap of the curl, one by the head and one by
+  // the tail tip, and another larva coming in from outside toward the tail.
+  const at = (a, r) => ({ x: C.x + r * Math.cos(a), y: C.y + r * Math.sin(a) });
+  const tipA = Math.atan2(body.points().tailEnd.y - C.y, body.points().tailEnd.x - C.x);
+  const headA = phi + dir * (thM + 2 * Math.asin(Math.min(1, BODY.HEAD_D / (2 * R))));
+  const obs = [
+    Object.assign(at(headA, R), { r: RING.STONE_R, live: false, name: 'stone by the head', out: false }),
+    Object.assign(at(tipA, R), { r: RING.STONE_R, live: false, name: 'stone by the tail', out: false }),
+    Object.assign(at(tipA + dir * 0.5, R + 2), { r: RING.LIVE_R, live: true, name: 'another larva', out: false, waiting: false })
+  ];
+  // slide each stone along the ring, out of the body, into the gap
+  for (const o of obs) if (!o.live) {
+    const step = o.name === 'stone by the head' ? dir * 0.02 : -dir * 0.02;
+    let a = Math.atan2(o.y - C.y, o.x - C.x), k = 0;
+    while (touch(o).gap < 0.05 && k++ < 400) { a += step; Object.assign(o, at(a, R)); }
+  }
+  // nothing starts inside anything: the stones apart from each other as well
+  for (let k = 0; k < 400; k++) {
+    const [s1, s2] = obs, d = Math.hypot(s1.x - s2.x, s1.y - s2.y);
+    if (d >= s1.r + s2.r + 0.05) break;
+    // the gap is too small for both: the one by the tail lies a little further out
+    const a2 = Math.atan2(s2.y - C.y, s2.x - C.x), r2 = Math.hypot(s2.x - C.x, s2.y - C.y) + 0.02; Object.assign(s2, at(a2, r2));
+  }
+  // in the solver: stones are loose rigid balls; the other larva is a ball that
+  // presses in by itself and shakes. The body moves them only by touching them.
+  const ph = attachPhysics(body);
+  if (ph) for (const o of obs) o.ball = ph.world.addBall(o.x, o.y, o.r, false);
+  const sync = () => { if (ph) for (const o of obs) { const q = ph.world.ballAt(o.ball); o.x = q.x; o.y = q.y; } };
+  const clearR = R + BODY.TAIL_D / 2 + 0.3;
+  const isOut = o => Math.hypot(o.x - C.x, o.y - C.y) - o.r >= clearR;
+
+  let t = 0, state = 'crawl', why = 'curled on its side, crawling round its own curl', cur = null, sway = 0;
+  let inStroke = false, f = 0, phiS = 0, guard = false;
+  const STEP = GAIT.STEP / R;                  // ring angle gained per stroke
+
+  function resolve() {
+    for (const o of obs) for (let k = 0; k < 6; k++) {
+      const g = touch(o);
+      if (!g || g.gap >= 0) break;
+      let ux = o.x - g.at.x, uy = o.y - g.at.y; const L = Math.hypot(ux, uy) || 1;
+      o.x += ux / L * (-g.gap + 1e-4); o.y += uy / L * (-g.gap + 1e-4);
+    }
+  }
+  const head = (want, dt) => { const rt = GAIT.HEAD_RATE * DEG * dt * 3; body.delta = body.clampHead(body.delta + clamp(want - body.delta, -rt, rt)); };
+
+  return {
+    body, target: null,
+    step(dt) {
+      t += dt; sway += 2 * Math.PI * dt / GAIT.STROKE_S;
+      const live = obs.find(o => o.live);
+      sync();
+      if (ph) {
+        // the other larva presses in toward this one's nearest part, shaking, until it is pushed away
+        if (!live.out) {
+          let near = null;
+          for (const pt of parts()) { const sd = segDist(live, pt.a, pt.b); if (!near || sd.d - pt.r < near.d) near = { d: sd.d - pt.r, p: sd.p }; }
+          const d = Math.hypot(live.x - near.p.x, live.y - near.p.y) || 1;
+          const sh = RING.SHAKE / Harness.DT;
+          ph.world.driveBall(live.ball, -(live.x - near.p.x) / d * RING.CREEP + rO.range(-sh, sh), -(live.y - near.p.y) / d * RING.CREEP + rO.range(-sh, sh), RING.LIVE_PRESS, dt);
+        }
+      } else if (!live.out && cur !== live && !live.waiting) {
+        // toward the nearest part of this larva's body, from outside
+        let near = null;
+        for (const pt of parts()) { const sd = segDist(live, pt.a, pt.b); if (!near || sd.d - pt.r < near.d) near = { d: sd.d - pt.r, p: sd.p }; }
+        const d = Math.hypot(live.x - near.p.x, live.y - near.p.y) || 1;
+        const nx = live.x - (live.x - near.p.x) / d * RING.CREEP * dt, ny = live.y - (live.y - near.p.y) / d * RING.CREEP * dt;
+        const g = touch({ x: nx, y: ny, r: live.r });
+        // once it touches it stays there, pressing and shaking, until it is pushed away
+        if (!g || g.gap > 0.005) { live.x = nx; live.y = ny; } else live.waiting = true;
+      }
+      if (!ph) { live.jx = rO.range(-RING.SHAKE, RING.SHAKE); live.jy = rO.range(-RING.SHAKE, RING.SHAKE); }
+      const liveAtTail = !live.out && (() => {
+        let best = 1e9; for (const pt of parts()) if (pt.name === 'tail' || pt.name === 'back') {
+          const sd = segDist(live, pt.a, pt.b); best = Math.min(best, sd.d - pt.r - live.r); }
+        // on when it comes within 2.5 mm, off only once it is 5 mm clear: no flicker
+        guard = guard ? best < 0.5 : best < 0.25;
+        return guard; })();
+
+      if (state === 'crawl') {
+        // tail strokes: lift and curl further, lay down, push while easing back
+        if (!inStroke) { inStroke = true; f = 0; phiS = phi; }
+        f += dt * body.tempo / GAIT.STROKE_S;
+        let lam = 0, extra = 0;
+        if (f < 0.38) { const g = smooth(f / 0.38); extra = RING.SWING * DEG * g; lam = RING.LIFT * DEG * Math.sin(Math.PI * Math.min(1, f / 0.38)); }
+        else if (f < 0.45) { extra = RING.SWING * DEG; lam = 0; }
+        else { const g = smooth(clamp((f - 0.45) / 0.5, 0, 1)); extra = RING.SWING * DEG * (1 - g); phi = phiS + dir * STEP * g; }
+        if (f >= 1) { inStroke = false; done += STEP; phi = phiS + dir * STEP; }
+        // something alive at the soft tail: hold the tail up off it
+        if (liveAtTail) lam = Math.max(lam, RING.GUARD * DEG);
+        body.lam = lam; body.beta = ringBeta + legs * extra;
+        place();
+        head(headBias + GAIT.SCAN * DEG * Math.sin(sway), dt);
+        why = liveAtTail ? 'something alive at my soft tail — tail held up, crawling round to meet it head on'
+          : 'curled on its side, crawling round its own curl';
+        // what does it touch?
+        for (const o of obs) {
+          const g = touch(o);
+          if (!g || g.gap > 0.01 || isOut(o)) continue;
+          if (o.live && g.part !== 'head' && g.part !== 'front') continue;   // never pushed with the tail
+          cur = o; o.out = false;
+          if (o.live) { state = 'push-head'; why = 'it is at my head — pushing it out with head, jaws and legs'; }
+          else if (g.part === 'tail' || g.part === 'back') { state = 'push-tail'; why = 'a stone at my tail — pushing it out with the tail'; }
+          else { state = 'push-head'; why = 'a stone at my head — pushing it out with head and legs'; }
+          break;
+        }
+      } else {
+        // push straight out from the ring's centre until it is clear of the curl
+        const ux = cur.x - C.x, uy = cur.y - C.y, L = Math.hypot(ux, uy) || 1;
+        if (ph) {
+          // head, jaws and legs (or the tail) shove it outward while they touch it
+          const g = touch(cur);
+          // (a shove has a speed: it moves the thing out at RING.PUSH, with at most RING.SHOVE of force)
+          const felt = ph.world.skinTouch.has(cur.ball.key) || ph.world.touching(ph.larva.headKey).some(c => c.other === cur.ball.key);
+          if (felt || (g && g.gap < 0.1)) ph.world.driveBall(cur.ball, ux / L * RING.PUSH, uy / L * RING.PUSH, RING.SHOVE, dt);
+        } else { cur.x += ux / L * RING.PUSH * dt; cur.y += uy / L * RING.PUSH * dt; }
+        if (state === 'push-head') head(headBias + GAIT.SCAN * DEG * Math.sin(sway * 3), dt);
+        else { body.lam = 0; body.beta = ringBeta + legs * RING.SWING * DEG * (ph ? Math.abs(Math.sin(sway * 2)) : Math.abs(Math.sin(sway * 2)) * -0.5); }   // the tail sweeps into it, curling further
+        if (isOut(cur) && (!cur.live || Math.hypot(cur.x - C.x, cur.y - C.y) - cur.r >= clearR + 1.0)) {
+          cur.out = true; body.beta = ringBeta; cur = null; state = 'crawl'; why = 'curled on its side, crawling round its own curl';
+        }
+      }
+      if (!ph) resolve();
+    },
+    status() {
+      const left = obs.filter(o => !isOut(o)).length;
+      const detail = 'on its ' + body.label + ' · ring ' + (2 * R * 10).toFixed(0) + ' mm across · ' + Math.round(done / DEG) + '° of 360° round · ' +
+        left + ' thing' + (left === 1 ? '' : 's') + ' still against the curl';
+      const action = { crawl: 'CRAWLING ROUND THE CURL', 'push-head': 'PUSHING WITH THE HEAD', 'push-tail': 'PUSHING WITH THE TAIL' }[state];
+      return { action, reason: why, detail };
+    },
+    done() {
+      if (done >= 2 * Math.PI && obs.every(isOut)) return { ok: true, why: 'turned right round its curl and pushed everything out' };
+      if (t > RING.MAX_T) return { ok: false, why: 'did not clear round itself in ' + RING.MAX_T + ' s' };
+      return null;
+    },
+    snapshot() {
+      const p = body.points();
+      let pen = 0, who = '';
+      for (const o of obs) { const g = touch({ x: o.x + (o.jx || 0), y: o.y + (o.jy || 0), r: o.r }); if (g && -g.gap > pen) { pen = -g.gap; who = o.name + ' at the ' + g.part; } }
+      const tmR = Math.hypot(body.x - C.x, body.y - C.y);
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: +body.delta.toFixed(5),
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+        tmR, state, ringPen: pen, who, liveTail: obs.some(o => o.live && cur !== o && o.pushedByTail), pushing: false, skipChecks: false,
+        obstacles: obs.map(o => ({ name: o.name, x: +o.x.toFixed(3), y: +o.y.toFixed(3) })) };
+    },
+    invariants: [
+      { name: 'overlap', check: (a, b) => (!ph && b.ringPen > 0.06) ? b.who + ' is ' + (b.ringPen * 10).toFixed(1) + ' mm inside the body' : null },
+      { name: 'joints', check: (a, b) => {
+        if (Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG) return 'tail–middle bent past ' + JOINT.BEND + '°';
+        const hl = body.headLim(b.delta >= 0 ? 1 : -1) + 0.5 * DEG;
+        return Math.abs(b.delta) > hl ? 'head bent past its limit' : null; } },
+      { name: 'on the ring', check: (a, b) => Math.abs(b.tmR - R) > 1e-6 ? 'the body left its ring' : null },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
+        return d > 0.05 ? 'head moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    // pushing is pressing on purpose: it does not stop for the pressure
+    keepWorking() { return state !== 'crawl'; },
+    pointer() { return false; },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      ctx.save();
+      ctx.strokeStyle = '#999'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.arc(X(C.x), Y(C.y), R * PX, 0, 2 * Math.PI); ctx.stroke();
+      ctx.setLineDash([]); ctx.strokeStyle = '#000'; ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
+      for (const o of obs) {
+        const ox = o.x + (o.jx || 0), oy = o.y + (o.jy || 0);
+        ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.arc(X(ox), Y(oy), o.r * PX, 0, 2 * Math.PI); ctx.stroke();
+        if (o.live) { ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.arc(X(ox), Y(oy), o.r * PX + 4, 0, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]); }
+        ctx.fillText(o.live ? 'alive' : 'stone', X(ox) - 12, Y(oy) - o.r * PX - 7);
+      }
+      ctx.restore();
+    }
+  };
+}
+
+
+/* ---------------- REFERENCE GLASS ----------------
+   One fixed piece, built from the larva and nothing else: a polygon with
+   curved (outward-bulging) edges, three of them, 7 mm thick (lying on the floor, its top is
+   7 mm up), big enough to cover a curled larva from above with at least 2 mm
+   to spare beyond every point of it. Pure geometry: no weight, no friction.
+   On the bench it lies on the floor beside the larva; the observer can drag
+   it and turn it with the wheel, but not into the larva. */
+const GLASS = {
+  THICK: 0.7,         // cm: the slab's thickness, i.e. its height off the floor when it lies flat
+  MARGIN: 0.2,        // cm: at least this much glass beyond every point of the larva
+  CURL: 110,          // deg: the curled larva it is made to cover (tail toward the legs)
+  HEAD_CURL: 40,      // deg: head bent toward the chest in the curl
+  // A triangle, so that not every turn of it covers the larva. The three edge
+  // directions give the smallest triangle that covers the curled larva with the
+  // margin (searched once, 2° steps); each edge bulges outward by its own amount (cm).
+  EDGES: [[88, 0.10], [200, 0.12], [336, 0.08]],
+  SLACK: 0.03         // cm: straight edges sit this far beyond the 2 mm line
+};
+
+// the curled larva as round parts (axis segment + radius), in its own frame
+function curledParts(body) {
+  const p = body.points();
+  return [
+    { a: p.TM, b: p.tailEnd, r: tailHalfW(body) },
+    { a: p.TM, b: p.MH, r: BODY.MID_D / 2 },
+    { a: p.head, b: p.head, r: BODY.HEAD_D / 2 }
+  ];
+}
+
+// build the reference outline once, around a curled larva centred at the origin
+function makeReferenceGlass() {
+  const b = makeBody('left', { range: (a) => a, sign: () => 1, next: () => 0.5 });
+  b.x = 0; b.y = 0; b.psi = 0; b.lam = 0;
+  b.flat = 1;                 // under a glass the tail is pressed flat, so a little wider
+  b.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  b.delta = b.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  const parts = curledParts(b);
+  // points of the larva's outline grown by the margin
+  const pts = [];
+  for (const pt of parts) for (let k = 0; k <= 20; k++) {
+    const t = k / 20, cx = pt.a.x + (pt.b.x - pt.a.x) * t, cy = pt.a.y + (pt.b.y - pt.a.y) * t;
+    for (let j = 0; j < 36; j++) { const a = j / 36 * 2 * Math.PI; pts.push({ x: cx + Math.cos(a) * (pt.r + GLASS.MARGIN), y: cy + Math.sin(a) * (pt.r + GLASS.MARGIN) }); }
+  }
+  // each edge is the supporting line in its direction, a little further out
+  const lines = GLASS.EDGES.map(([deg, bulge]) => {
+    const a = deg * DEG, n = { x: Math.cos(a), y: Math.sin(a) };
+    let h = -Infinity; for (const q of pts) h = Math.max(h, q.x * n.x + q.y * n.y);
+    return { n, h: h + GLASS.SLACK, bulge };
+  });
+  // corners: neighbouring edge lines meet
+  const corners = lines.map((L, i) => {
+    const M = lines[(i + 1) % lines.length], det = L.n.x * M.n.y - L.n.y * M.n.x;
+    return { x: (L.h * M.n.y - M.h * L.n.y) / det, y: (L.n.x * M.h - M.n.x * L.h) / det };
+  });
+  // each edge bows outward along a circular arc
+  const outline = [];
+  for (let i = 0; i < corners.length; i++) {
+    const A = corners[(i - 1 + corners.length) % corners.length], B = corners[i], L = lines[i];
+    for (let k = 0; k < 24; k++) {
+      const t = k / 24, bow = 4 * L.bulge * t * (1 - t);
+      outline.push({ x: A.x + (B.x - A.x) * t + L.n.x * bow, y: A.y + (B.y - A.y) * t + L.n.y * bow });
+    }
+  }
+  // centre the outline on its own centroid; keep the larva's place relative to it
+  let ax = 0, ay = 0, A2 = 0;
+  for (let i = 0, j = outline.length - 1; i < outline.length; j = i++) {
+    const f = outline[j].x * outline[i].y - outline[i].x * outline[j].y;
+    A2 += f; ax += (outline[j].x + outline[i].x) * f; ay += (outline[j].y + outline[i].y) * f;
+  }
+  const cx = ax / (3 * A2), cy = ay / (3 * A2);
+  return { local: outline.map(q => ({ x: q.x - cx, y: q.y - cy })), larvaAt: { x: -cx, y: -cy }, area: Math.abs(A2) / 2, corners: corners.length };
+}
+const REF_GLASS = makeReferenceGlass();
+
+function polyContains(poly, q) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+function polyEdgeDist(poly, q) {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[j], b = poly[i], vx = b.x - a.x, vy = b.y - a.y, L2 = vx * vx + vy * vy;
+    const t = L2 ? clamp(((q.x - a.x) * vx + (q.y - a.y) * vy) / L2, 0, 1) : 0;
+    best = Math.min(best, Math.hypot(q.x - a.x - t * vx, q.y - a.y - t * vy));
+  }
+  return best;
+}
+// least glass beyond any point of the larva (negative: some of the larva sticks out)
+function coverMargin(parts, poly) {
+  let m = Infinity;
+  for (const pt of parts) for (let k = 0; k <= 30; k++) {
+    const t = k / 30, q = { x: pt.a.x + (pt.b.x - pt.a.x) * t, y: pt.a.y + (pt.b.y - pt.a.y) * t };
+    const d = polyEdgeDist(poly, q);
+    m = Math.min(m, polyContains(poly, q) ? d - pt.r : -d - pt.r);
+  }
+  return m;
+}
+function longest(poly) { let L = 0; for (const a of poly) for (const b of poly) L = Math.max(L, Math.hypot(a.x - b.x, a.y - b.y)); return L; }
+
+// how much glass the reference piece leaves beyond a curled larva it covers
+function refCover() {
+  const b = makeBody('left', { range: (a) => a, sign: () => 1, next: () => 0.5 });
+  b.x = REF_GLASS.larvaAt.x; b.y = REF_GLASS.larvaAt.y; b.psi = 0; b.lam = 0; b.flat = 1;
+  b.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  b.delta = b.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  return coverMargin(curledParts(b), REF_GLASS.local);
+}
+const REF_COVER = refCover();
+
+// The glass lies flat on the floor, the curled larva beside it. Both are on
+// the floor, so neither can be moved into the other.
+function createGlassBench(skill, rng, params) {
+  const body = makeBody('left', rng('larva'));
+  body.psi = 0; body.lam = 0;
+  body.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  body.delta = body.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  body.x = ARENA.W / 2 - 0.5; body.y = ARENA.H / 2 - 1.5;
+  const ph = attachPhysics(body);
+  const span = longest(REF_GLASS.local);
+  const g = ph.world.addGlass(REF_GLASS.local, GLASS.THICK, ARENA.W / 2, ARENA.H / 2 + 2.5, 0, 0.001);
+  // the observer's hand: drag and turn; the solver keeps the glass out of the larva
+  let drag = null;
+  const hand = new GlassHand(ph.world, g);
+  return {
+    body, target: null,
+    step(dt) { hand.step(dt); },
+    status() {
+      const tilt = ph.world.glassTilt(g);
+      return { action: drag ? 'GLASS IN THE OBSERVER\'S HAND' : 'GLASS ON THE FLOOR',
+        reason: 'a ' + GLASS.THICK * 10 + ' mm slab' + (tilt > 2 * DEG ? ', tilted ' + Math.round(tilt / DEG) + '°' : ' lying flat') + ', next to a curled larva',
+        detail: REF_GLASS.corners + ' curved edges · ' + REF_GLASS.area.toFixed(1) + ' cm² · ' + (span * 10).toFixed(0) +
+          ' mm across · would cover this larva curled up with ' + (REF_COVER * 10).toFixed(1) + ' mm to spare · turned ' + Math.round(ph.world.glassAngle(g) / DEG) + '°' };
+    },
+    done() { return null; },
+    snapshot() { return { G: glassSnap(ph.world, g), skipChecks: !!drag }; },
+    invariants: [],
+    pointer(kind, px, py, extra) {
+      const w = { x: px / PX, y: ARENA.H - py / PX };
+      const poly = glassSeen(ph.world, g).out;
+      const c = ph.world.glassToWorld(g, 0, 0, 0), ang = ph.world.glassAngle(g);
+      if (kind === 'down') { if (polyContains(poly, w)) { drag = { dx: c.x - w.x, dy: c.y - w.y }; hand.want = { x: c.x, y: c.y, rot: ang }; hand.held = true; } return true; }
+      if (kind === 'move' && drag) { hand.want = { x: w.x + drag.dx, y: w.y + drag.dy, rot: hand.want.rot }; return true; }
+      if (kind === 'up') { if (drag) { hand.held = false; hand.left = 0.3; } drag = null; return true; }
+      if (kind === 'wheel' && polyContains(poly, w)) { if (!hand.want) hand.want = { x: c.x, y: c.y, rot: ang }; hand.want.rot += extra.delta * 5 * DEG; if (!drag) hand.left = 0.6; return true; }
+      return false;
+    },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      drawGlassPhys(ctx, W, H, ph.world, g, body, { label: 'glass, cut along the body\'s axis' });
+      ctx.fillStyle = '#000'; ctx.font = '11px Helvetica, Arial, sans-serif';
+      ctx.fillText('drag the glass · wheel over it turns it · it cannot be pushed into the larva', 14, 18);
+    }
+  };
+}
+
+/* The observer's hand on a glass: it drives the glass toward where the pointer
+   wants it, quickly but with a limited speed, through the solver. */
+function GlassHand(world, g) {
+  this.want = null; this.left = 0;
+  this.step = dt => {
+    if (!this.want) return;
+    const c = world.glassToWorld(g, 0, 0, 0), ang = world.glassAngle(g), want = this.want;
+    const vx = clamp((want.x - c.x) / 0.2, -6, 6), vy = clamp((want.y - c.y) / 0.2, -6, 6), w = clamp(wrap(want.rot - ang) / 0.2, -3, 3);
+    world.driveGlass(g, vx, vy, w);
+    if (!this.held) { this.left -= dt; if (this.left <= 0) { this.want = null; world.driveGlass(g, 0, 0, 0); } }
+  };
+}
+
+// a glass as seen from above (solver pose): underside, top face, outline
+function glassSeen(world, g) {
+  const pose = world.glassPose(g);
+  const bottom = pose.bottom.map(q => ({ x: q.x, y: q.y })), top = pose.top.map(q => ({ x: q.x, y: q.y }));
+  return { bottom, top, out: convexHull(bottom.concat(top)), pose };
+}
+function glassSnap(world, g) {
+  const c = world.glassToWorld(g, 0, 0, 0), sp = world.glassSpeed(g);
+  return { x: +c.x.toFixed(4), y: +c.y.toFixed(4), z: +c.z.toFixed(4), rot: +world.glassAngle(g).toFixed(5), tilt: +world.glassTilt(g).toFixed(5), v: +sp.v.toFixed(3), w: +sp.w.toFixed(3) };
+}
+
+/* Draw a glass from the solver: from above, its outline, its top face and,
+   where it is lifted, the edge face between them; in the side box, the slab cut
+   by the upright plane through the middle's axis. */
+function drawGlassPhys(ctx, W, H, world, g, body, opts = {}) {
+  const sn = glassSeen(world, g);
+  const path = pts => { ctx.beginPath(); pts.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath(); };
+  ctx.save();
+  ctx.strokeStyle = opts.color || '#000';
+  const tilt = world.glassTilt(g);
+  if (tilt > 0.5 * DEG) {
+    ctx.beginPath();
+    sn.out.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
+    sn.top.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
+    ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fill('evenodd');
+  }
+  path(sn.top); ctx.fillStyle = 'rgba(0,0,0,0.05)'; ctx.fill(); ctx.lineWidth = opts.thin ? 1 : 1.4;
+  if (opts.dashed) ctx.setLineDash([4, 3]);
+  ctx.stroke(); path(sn.out); ctx.stroke(); ctx.setLineDash([]);
+  ctx.restore();
+  if (opts.noSide) return;
+  // the side box: cut the slab with the upright plane through the body's axis
+  const bw = 230, x0 = W - bw - 10, y0 = 10, K = 36, fy = y0 + 110 - 14, ox = x0 + 130;
+  const u = body.u(), nrm = { x: -u.y, y: u.x };
+  const P3 = sn.pose.bottom.concat(sn.pose.top), n = sn.pose.bottom.length;
+  const edges = [];
+  for (let i = 0; i < n; i++) { edges.push([i, (i + 1) % n]); edges.push([n + i, n + (i + 1) % n]); edges.push([i, n + i]); }
+  const side = q => (q.x - body.x) * nrm.x + (q.y - body.y) * nrm.y;
+  const cut = [];
+  for (const [a, b] of edges) {
+    const A = P3[a], B = P3[b], sa = side(A), sb = side(B);
+    if ((sa > 0) === (sb > 0)) continue;
+    const t = sa / (sa - sb), q = { x: A.x + (B.x - A.x) * t, y: A.y + (B.y - A.y) * t, z: A.z + (B.z - A.z) * t };
+    cut.push({ x: (q.x - body.x) * u.x + (q.y - body.y) * u.y, y: q.z });
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, 108); ctx.clip();
+  ctx.strokeStyle = opts.color || '#000'; ctx.lineWidth = 1.2; if (opts.dashed) ctx.setLineDash([4, 3]);
+  if (cut.length >= 3) {
+    const hull = convexHull(cut);
+    ctx.beginPath(); hull.forEach((q, i) => i ? ctx.lineTo(ox + q.x * K, fy - q.y * K) : ctx.moveTo(ox + q.x * K, fy - q.y * K)); ctx.closePath(); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
+  if (opts.label) ctx.fillText(cut.length >= 3 ? opts.label : 'the glass is not over the body\'s axis', x0 + 6, y0 + 24);
+  ctx.restore();
+}
+
+/* How the glass covers the larva, from above, with the solver's shapes: every
+   point of the skin and of the head should have at least GLASS.MARGIN of glass
+   beyond it. Returns the total shortfall and the part that is shortest. */
+function coverShort(ph, poly) {
+  const pts = larvaPoints(ph);
+  let sum = 0, worst = 0, where = '', wq = null;
+  for (const q of pts) {
+    const d = polyEdgeDist(poly, q), m = (polyContains(poly, q) ? d : -d) - q.rad;
+    const lack = Math.max(0, GLASS.MARGIN - m);
+    sum += lack; if (lack > worst) { worst = lack; where = q.part; wq = q; }
+  }
+  return { sum, worst, where, wq };
+}
+// the larva's outline points from above: skin (every other ring) and the head's rim
+function larvaPoints(ph) {
+  const sk = ph.world.skinPoints(ph.larva), out = [];
+  for (let i = 0; i < sk.length; i++) out.push({ x: sk[i].x, y: sk[i].y, rad: Physics.VR, part: sk[i].s < BODY.TAIL_LEN ? 'tail' : 'middle' });
+  const h = ph.world.headPoint(ph.larva), r = BODY.HEAD_D / 2;
+  for (let k = 0; k < 12; k++) out.push({ x: h.x + Math.cos(k * Math.PI / 6) * r, y: h.y + Math.sin(k * Math.PI / 6) * r, rad: 0, part: 'head' });
+  return out;
+}
+function coverMarginPhys(ph, poly) {
+  let m = Infinity;
+  for (const q of larvaPoints(ph)) { const d = polyEdgeDist(poly, q); m = Math.min(m, (polyContains(poly, q) ? d : -d) - q.rad); }
+  return m;
+}
+
+/* The legs set a glass that lies on the body, by feel (as before): each beat
+   they try small turns (about the point over the legs, or the glass's own
+   middle) and slides, keep the one that leaves less of the larva short of
+   glass, and drive the glass that way through the solver for the working part
+   of the beat; in the pause they hold it. When no small move helps they turn it
+   on round, sliding as they go, until it is clearly better. */
+const TRY = {
+  TURN: 30 * DEG, SLIDE: 0.2,   // average, per second
+  BEAT: 0.4, PUSH: 0.15,        // the legs work in beats: 0.15 s of moving in every 0.4 s
+  GIVE_UP: 4 * Math.PI,         // radians turned round without success before giving up
+  SMALL: 0.75,                  // the small glass, as a share of the reference size
+  MOVE_S: 1.5,                  // seconds for a plain move of a glass onto the back
+  OFF_SPEED: 1.0,               // cm/s the legs slide a rejected glass off
+  SETTLE_S: 1.0,                // seconds a glass is left to settle on the body
+  LEG_FORCE: 20000,             // g·cm/s²: the most the legs push a glass with (about 20 g-force)
+  OFF_FORCE: 6000               // g·cm/s²: how hard they shove a glass they let go off the body
+};
+function makeSetterPhys(body, ph, g) {
+  const pivot = () => { const p = body.points(); return { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }; };
+  // a rigid move of the outline: turn by a about P, then slide by (dx, dy)
+  const moved = (poly, P, a, dx, dy) => { const c = Math.cos(a), s2 = Math.sin(a);
+    return poly.map(q => ({ x: P.x + (q.x - P.x) * c - (q.y - P.y) * s2 + dx, y: P.y + (q.x - P.x) * s2 + (q.y - P.y) * c + dy })); };
+  const S = { work: 'turn', sweep: 1, sweepFrom: 0, swept: 0, turnedTotal: 0, beat: 0 };
+  const G = ph.world.grip(g);       // the legs take hold of it
+  S.short = () => coverShort(ph, glassSeen(ph.world, g).out);
+  S.release = () => ph.world.release(g);
+  S.step = dt => {
+    S.beat = (S.beat + dt) % TRY.BEAT;
+    // the legs feel it when the glass will not follow (it is up against something):
+    // they stop where the glass is instead of pushing on into it
+    { const c = g.body.GetCenterOfMassPosition(), lag = Math.hypot(c.GetX() - G.x, c.GetZ() - G.y), turn = Math.abs(wrap(ph.world.glassAngle(g) - G.yaw));
+      if (lag > 0.08 || turn > 3 * DEG) { G.x = c.GetX(); G.y = c.GetZ(); G.yaw = ph.world.glassAngle(g); S.stuck = (S.stuck || 0) + 1; } }
+    const hold = () => ph.world.moveGrip(g, G.x, G.y, G.yaw, dt);
+    const poly = glassSeen(ph.world, g).out, now = coverShort(ph, poly);
+    if (now.sum <= 1e-9) { hold(); return 'covered'; }
+    if (S.beat >= TRY.PUSH) { hold(); return null; }   // the pause: the legs hold it where it is
+    const k = TRY.BEAT / TRY.PUSH, a = TRY.TURN * dt * k, d = TRY.SLIDE * dt * k;
+    const c = centroidOf(poly), Pl = pivot();
+    const tries = [];
+    if (S.work === 'sweep') {
+      for (const [ex, ey] of [[0, 0], [d, 0], [-d, 0], [0, d], [0, -d]]) tries.push({ P: Pl, a: S.sweep * a, dx: ex, dy: ey });
+    } else {
+      tries.push({ P: Pl, a, dx: 0, dy: 0 }, { P: Pl, a: -a, dx: 0, dy: 0 }, { P: c, a, dx: 0, dy: 0 }, { P: c, a: -a, dx: 0, dy: 0 },
+        { P: c, a: 0, dx: d, dy: 0 }, { P: c, a: 0, dx: -d, dy: 0 }, { P: c, a: 0, dx: 0, dy: d }, { P: c, a: 0, dx: 0, dy: -d });
+      if (now.wq) { const vx = now.wq.x - c.x, vy = now.wq.y - c.y, n = Math.hypot(vx, vy) || 1; tries.push({ P: c, a: 0, dx: vx / n * d, dy: vy / n * d }); }
+    }
+    let best = null, bestS = S.work === 'sweep' ? Infinity : now.sum;
+    for (const t of tries) { const v = coverShort(ph, moved(poly, t.P, t.a, t.dx, t.dy)).sum; if (v < bestS - 1e-9) { bestS = v; best = t; } }
+    if (S.work === 'sweep') {
+      S.swept += a; S.turnedTotal += a;
+      if (bestS < 0.6 * S.sweepFrom) S.work = 'turn';
+      else if (S.swept > 2 * Math.PI) { S.sweep = -S.sweep; S.swept = 0; }
+    } else if (best) {
+      if (best.a) { S.sweep = Math.sign(best.a); S.turnedTotal += a; }
+      S.work = best.a ? 'turn' : 'slide';
+    } else { S.work = 'sweep'; S.sweepFrom = now.sum; S.swept = 0; hold(); return S.turnedTotal > TRY.GIVE_UP ? 'give-up' : null; }
+    // the legs carry their hold that way: the grip point turns about P and slides
+    const cs = Math.cos(best.a), sn = Math.sin(best.a), rx = G.x - best.P.x, ry = G.y - best.P.y;
+    ph.world.moveGrip(g, best.P.x + rx * cs - ry * sn + best.dx, best.P.y + rx * sn + ry * cs + best.dy, G.yaw + best.a, dt);
+    return S.turnedTotal > TRY.GIVE_UP ? 'give-up' : null;
+  };
+  return S;
+}
+function centroidOf(poly) { let ax = 0, ay = 0, A = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const f = poly[j].x * poly[i].y - poly[i].x * poly[j].y; A += f; ax += (poly[j].x + poly[i].x) * f; ay += (poly[j].y + poly[i].y) * f; }
+  return { x: ax / (3 * A), y: ay / (3 * A) }; }
+
+/* ---------------- TRYING GLASSES ON (on the solver) ----------------
+   Two glasses: the reference one, and the same shape at three quarters of its
+   size, which cannot cover the curled larva with 2 mm however it lies. The
+   observer lays one on the curled larva at Пуск; the other lies on the floor.
+   The larva sets the glass on its back by feel. If it cannot get covered after
+   turning the glass twice right round, its legs slide it off onto the floor and
+   it takes the other one. Taking a glass from the floor is still shown as a
+   plain move: that is the getting-under skill. */
+function createGlassTry(skill, rng, params) {
+  const body = makeBody('left', rng('larva'));
+  body.psi = 0; body.lam = 0;
+  body.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  body.delta = body.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  body.headLift = HEAD_LIFT_UNDER;       // it works under glass: the head is held low
+  body.x = ARENA.W / 2 - 0.5; body.y = ARENA.H / 2 - 2;
+  const ph = attachPhysics(body);
+  const home = { x: body.x - REF_GLASS.larvaAt.x, y: body.y - REF_GLASS.larvaAt.y };   // where the glass was made to sit over this curl
+  const shapes = [
+    { name: 'small', local: REF_GLASS.local.map(q => ({ x: q.x * TRY.SMALL, y: q.y * TRY.SMALL })), floor: { x: ARENA.W / 2 - 6, y: ARENA.H / 2 + 4, rot: 0.4 } },
+    { name: 'normal', local: REF_GLASS.local, floor: { x: ARENA.W / 2 + 5.5, y: ARENA.H / 2 + 4, rot: -0.3 } }
+  ];
+  const firstIdx = params.firstGlass === 'normal' ? 1 : 0;
+  // a glass is laid on from just above the larva (0.1 mm over its highest point)
+  const ONTOP = (() => { const sk = ph.world.skinPoints(ph.larva), h = ph.world.headPoint(ph.larva);
+    return Math.max(h.z + BODY.HEAD_D / 2, ...sk.map(q => q.z + Physics.VR)) + 0.01; })();
+  // the given one on the back, badly turned; the other on the floor
+  for (const [i, sh] of shapes.entries()) {
+    if (i === firstIdx) { sh.g = ph.world.addGlass(sh.local, GLASS.THICK, home.x + 0.2, home.y - 0.15, 70 * DEG, ONTOP); ph.world.setWeight(sh.g, 0); }
+    else sh.g = ph.world.addGlass(sh.local, GLASS.THICK, sh.floor.x, sh.floor.y, sh.floor.rot, 0.001);
+    sh.tried = false; sh.rejected = false;
+  }
+  let cur = shapes[firstIdx], state = 'settle', t = 0, k = 0, setter = null;
+  return {
+    body, target: null,
+    step(dt) {
+      t += dt;
+      if (state === 'settle') { k += dt; ph.world.setWeight(cur.g, Math.min(1, k / (TRY.SETTLE_S * 0.6)));   // laid on gently, not dropped
+        if (k >= TRY.SETTLE_S) { state = 'set'; setter = makeSetterPhys(body, ph, cur.g); cur.tried = true; } }
+      else if (state === 'set') {
+        const r = setter.step(dt);
+        if (r === 'covered') state = 'keep';
+        else if (r === 'give-up') { cur.rejected = true; state = 'off'; k = 0; setter.release(); }
+        if (r === 'covered') setter.release();
+      } else if (state === 'off') {
+        // the legs let go of it and shove it off sideways, away from the body, with a
+        // limited force, until it is off the body; it tips down onto the floor by itself
+        k += dt;
+        if (!cur.letGo) { ph.world.release(cur.g); cur.letGo = true; }
+        const c0 = cur.g.body.GetCenterOfMassPosition(), P = body.points().TM, dx = c0.GetX() - P.x, dy = c0.GetZ() - P.y, n = Math.hypot(dx, dy) || 1;
+        const out = glassSeen(ph.world, cur.g).out;
+        const onBody = larvaPoints(ph).some(q => polyContains(out, q) || polyEdgeDist(out, q) < 0.3);
+        const resting = ph.world.glassSpeed(cur.g).v < 0.05;
+        if (onBody && k < 8) ph.world.pushGlass(cur.g, dx / n * TRY.OFF_FORCE, dy / n * TRY.OFF_FORCE, 0, { x: c0.GetX(), y: c0.GetZ(), z: c0.GetY() });
+        else if (resting || k > 12) {
+          const other = shapes.find(s2 => s2 !== cur);
+          if (other.tried && other.rejected) state = 'none';
+          else { cur = other; state = 'take'; k = 0; }
+        }
+      } else if (state === 'take') {
+        // a plain move: the other glass is put on the back, from just above
+        k += dt;
+        if (k >= TRY.MOVE_S) {
+          // plain moves (not modelled yet): the let-go glass is put where the other one lay, the other on the back
+          const old = shapes.find(s2 => s2 !== cur);
+          ph.world.placeGlass(old.g, cur.floor.x, cur.floor.y, cur.floor.rot, 0.001);
+          ph.world.placeGlass(cur.g, home.x + 0.2, home.y - 0.15, 70 * DEG, ONTOP); ph.world.setWeight(cur.g, 0); state = 'settle'; k = 0;
+        }
+      }
+    },
+    status() {
+      const sh = setter ? setter.short() : null;
+      const detail = 'trying the ' + cur.name + ' glass · tilted ' + Math.round(ph.world.glassTilt(cur.g) / DEG) + '°';
+      if (state === 'settle') return { action: 'THE GLASS SETTLES ON ME', reason: 'the ' + cur.name + ' glass is laid on my back; it comes to rest on my body', detail };
+      if (state === 'set') return { action: 'TRYING THE ' + cur.name.toUpperCase() + ' GLASS ON', reason: (sh && sh.where ? 'the ' + sh.where + ' is short of glass — ' : '') + 'working it round with the legs', detail };
+      if (state === 'off') return { action: 'LETTING IT GO', reason: 'the ' + cur.name + ' glass never covered me — the legs slide it off', detail };
+      if (state === 'take') return { action: 'TAKING THE OTHER GLASS', reason: 'shown as a plain move: getting under a glass is a skill of its own', detail };
+      if (state === 'keep') return { action: 'KEEPING IT', reason: 'the ' + cur.name + ' glass covers me all round with 2 mm', detail };
+      return { action: 'NO GLASS FITS', reason: 'neither glass covered me', detail };
+    },
+    done() {
+      if (state === 'keep') return { ok: cur.name === 'normal', why: 'kept the ' + cur.name + ' glass' };
+      if (state === 'none') return { ok: false, why: 'neither glass covered it' };
+      if (t > 600) return { ok: false, why: 'still trying after 600 s' };
+      return null;
+    },
+    snapshot() { return { G: glassSnap(ph.world, cur.g), state, skipChecks: state === 'take' }; },
+    // the body lies still here; only the legs work the glass, so nothing to hold back
+    keepWorking() { return true; },
+    invariants: [
+      // nothing here is thrown: faster than a fall from the larva's height (about 40 cm/s) is a jump
+      { name: 'glass jump', check: (a, b) => (b.state !== 'take' && a.state !== 'take' && b.G.v > 60) ? 'a glass moves at ' + b.G.v.toFixed(1) + ' cm/s' : null }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      for (const sh of shapes) {
+        const on = sh === cur && state !== 'off';
+        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { dashed: !on, thin: !on, noSide: !on, label: 'glass on the back, cut along the body\'s axis' });
+        const poly = glassSeen(ph.world, sh.g).out; let top = -Infinity, left = Infinity; for (const q of poly) { top = Math.max(top, q.y); left = Math.min(left, q.x); }
+        ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
+        ctx.fillText(sh.name + (sh.rejected ? ' — let go' : sh === cur && state === 'keep' ? ' — kept' : on ? ' — on its back' : ' — on the floor'), X(left), Y(top) - 6);
+      }
+    }
+  };
+}
+
+/* ---------------- GETTING UNDER A GLASS (on the solver) ----------------
+   The larva crawls up to a glass lying on the floor. When its head meets the
+   glass it stops, turns its middle legs-down, lowers its head, takes the edge
+   in its jaws and lifts it, beat by beat; the legs then push the head and body
+   in under it. From there nothing is scripted about the glass: it rests where
+   the solver puts it — on its far edge and on the head, then, once the head is
+   past its balance, tipping onto the back. The larva lies on its side (or rolls
+   onto its back), curls up, and sets the glass with its legs until covered. */
+const UNDER = {
+  START: 5,           // cm from the glass's middle at the start
+  TWIST_S: 1.0,       // s to turn the front legs-down
+  BEAT: 0.5, WORK: 0.3,
+  JAW_BEATS: 4,       // beats of the jaws to lift the edge
+  JAW_LIFT: 0.7,      // cm: the jaws raise the edge this high, above the lowered head
+  JAW_FORCE: 15000,   // g·cm/s² at most (about 15 g-force)
+  PUSH: 0.15,         // cm/s the legs push the body in, on average over the beats
+  LIE_S: 1.0, ROLL_S: 2.0, CURL_S: 1.5
+};
+function createGlassUnder(skill, rng, params) {
+  const rL = rng('larva'), rG = rng('glass');
+  const body = makeBody(skill.posture, rL);
+  const legs = POSTURES[skill.posture].legs;
+  const sideRho = skill.posture === 'left' ? 0 : Math.PI, downRho = skill.posture === 'left' ? -Math.PI / 2 : 1.5 * Math.PI;
+  const backRho = Math.PI / 2;
+  const G0 = { x: ARENA.W / 2 + 2, y: ARENA.H / 2, rot: rG.range(-Math.PI, Math.PI) };
+  const a0 = rL.range(-Math.PI, Math.PI);
+  body.x = G0.x + Math.cos(a0) * UNDER.START; body.y = G0.y + Math.sin(a0) * UNDER.START;
+  body.psi = wrap(a0 + Math.PI + rL.range(-0.3, 0.3));
+  const ph = attachPhysics(body);
+  const g = ph.world.addGlass(REF_GLASS.local, GLASS.THICK, G0.x, G0.y, G0.rot, 0.001);
+  const W_ = ph.world;
+  const U = () => body.u();
+  const along = q => { const u = U(); return (q.x - body.x) * u.x + (q.y - body.y) * u.y; };
+  const headOnGlass = () => W_.touching(ph.larva.headKey).find(c => c.other === g.key);
+  const skinOnGlass = () => (W_.skinTouch.get(g.key) || 0) > 0;
+  let t = 0, state = 'approach', k = 0, rhoFrom = 0, from = null, setter = null, course = null, beat = 0;
+  let grip = null, liftGoal = 0, jaws = null;    // where the jaws hold the glass, in the glass's own frame
+  body.rhoTail = undefined;
+  const toward = (cur, want, rate) => cur + clamp(want - cur, -rate, rate);
+  const working = () => (beat % UNDER.BEAT) < UNDER.WORK;
+  const lowest = () => Math.min(...W_.glassPose(g).bottom.map(q => q.z));
+  return {
+    body, target: null,
+    step(dt) {
+      t += dt;
+      if (state === 'approach') {
+        const c = centroidOf(glassSeen(W_, g).out);
+        body.step(dt, { go: true, aim: -wrap(Math.atan2(c.y - body.y, c.x - body.x) - body.psi) });
+        if (headOnGlass() || skinOnGlass()) { state = 'stop'; course = body.psi; }
+      } else if (state === 'stop') {
+        body.step(dt, { go: false, aim: body.delta });
+        if (!body.inStroke) { state = 'twist'; k = 0; body.rhoTail = sideRho; }
+      } else if (state === 'twist') {
+        k = Math.min(1, k + dt / UNDER.TWIST_S);
+        body.rho = sideRho + (downRho - sideRho) * smooth(k);
+        body.delta = toward(body.delta, 0, GAIT.HEAD_RATE * DEG * dt);
+        body.headLift = GAIT.HEAD_LIFT * DEG + (HEAD_LIFT_UNDER - GAIT.HEAD_LIFT * DEG) * smooth(k);
+        if (k >= 1) {
+          // the jaws take the glass where the head touches it (or right in front of the head)
+          const hc = headOnGlass(), h = W_.headPoint(ph.larva), u = U();
+          const at = hc ? hc.at : { x: h.x + u.x * BODY.HEAD_D / 2, y: h.y + u.y * BODY.HEAD_D / 2, z: 0.05 };
+          grip = W_.worldToGlass(g, { x: at.x, y: at.y, z: Math.min(at.z, 0.05) });
+          grip[1] = 0;   // on the underside, at the edge
+          const q0 = W_.glassToWorld(g, grip[0], grip[1], grip[2]);
+          jaws = W_.jaws(g, q0); jaws.base = q0;
+          state = 'jaws'; beat = 0; liftGoal = 0;
+        }
+      } else if (state === 'jaws' || state === 'push') {
+        beat += dt;
+        const before = Math.floor((beat - dt) / UNDER.BEAT);
+        if (state === 'jaws' && (Math.floor(beat / UNDER.BEAT) !== before || liftGoal === 0)) liftGoal = Math.min(UNDER.JAW_LIFT, liftGoal + UNDER.JAW_LIFT / UNDER.JAW_BEATS);
+        if (jaws) {
+          // the jaws raise the edge toward the goal, slowly (1.5 mm/s at most), working in beats,
+          // and hold it there; the glass turns about its far edge on the floor by itself
+          const zNow = jaws.z, want = Math.min(liftGoal, zNow + (working() || state === 'push' ? 0.15 * dt : 0));
+          // the head and jaws go along with the edge as it swings round its far edge; they only lift
+          const qn = W_.glassToWorld(g, grip[0], grip[1], grip[2]);
+          jaws.move(qn.x, qn.y, Math.max(zNow, want), dt);
+          // the jaws let go once the head is in under the edge
+          const q = W_.glassToWorld(g, grip[0], grip[1], grip[2]), h = W_.headPoint(ph.larva);
+          if (state === 'push' && along(q) < along(h) - BODY.HEAD_D / 2) { jaws.release(); jaws = null; grip = null; }
+        }
+        if (state === 'jaws' && jaws && jaws.z >= UNDER.JAW_LIFT - 1e-6) { state = 'push'; beat = 0; }
+        if (state === 'push') {
+          body.beta = toward(body.beta, 0, 30 * DEG * dt); body.lam = 0;
+          if (working()) { const v = UNDER.PUSH * UNDER.BEAT / UNDER.WORK * dt; body.x += Math.cos(body.psi) * v; body.y += Math.sin(body.psi) * v; body.travelled += v; }
+          // under it when the glass has come off the floor and lies on the body
+          if (!jaws && lowest() > 0.15 && W_.glassTilt(g) < 10 * DEG) { state = 'lie'; k = 0; rhoFrom = body.rho; }
+          else if (body.travelled > 12) { if (jaws) { jaws.release(); jaws = null; grip = null; } state = 'lie'; k = 0; rhoFrom = body.rho; }
+        }
+      } else if (state === 'lie') {
+        k = Math.min(1, k + dt / UNDER.LIE_S);
+        body.rho = rhoFrom + (sideRho - rhoFrom) * smooth(k);
+        if (k >= 1) {
+          body.rhoTail = undefined;
+          if (params.underLie === 'back') { state = 'roll'; k = 0; } else { state = 'curl'; k = 0; from = { beta: body.beta, delta: body.delta }; }
+        }
+      } else if (state === 'roll') {
+        k = Math.min(1, k + dt / UNDER.ROLL_S);
+        body.rho = sideRho + (backRho - sideRho) * smooth(k);
+        if (k >= 1) { state = 'curl'; k = 0; from = { beta: body.beta, delta: body.delta }; }
+      } else if (state === 'curl') {
+        k = Math.min(1, k + dt / UNDER.CURL_S);
+        body.beta = from.beta + (legs * GLASS.CURL * DEG - from.beta) * smooth(k);
+        body.delta = body.clampHead(from.delta + (legs * GLASS.HEAD_CURL * DEG - from.delta) * smooth(k));
+        if (k >= 1) { state = 'set'; setter = makeSetterPhys(body, ph, g); }
+      } else if (state === 'set') {
+        const r = setter.step(dt);
+        if (r === 'covered') state = 'covered'; else if (r === 'give-up') state = 'give-up';
+        if (r) setter.release();
+      }
+    },
+    status() {
+      const lie = params.underLie === 'back' ? 'back' : 'side';
+      const tilt = W_.glassTilt(g), lo = lowest();
+      const detail = 'glass tilted ' + Math.round(tilt / DEG) + '°, lowest corner ' + (lo * 10).toFixed(1) + ' mm up · crawled ' + body.travelled.toFixed(1) + ' cm' +
+        ((state === 'jaws' || state === 'push') ? (working() ? ' · beat: working' : ' · beat: pause') : '');
+      switch (state) {
+        case 'approach': return { action: 'CRAWLING TO THE GLASS', reason: 'a glass lies ahead', detail };
+        case 'stop': return { action: 'STOPPING', reason: 'my head has met the glass', detail };
+        case 'twist': return { action: 'TURNING LEGS-DOWN', reason: 'turning my middle onto the legs and lowering my head, to work the glass', detail };
+        case 'jaws': return { action: 'LIFTING THE EDGE', reason: 'the jaws take the edge and lift it, beat by beat', detail };
+        case 'push': return { action: 'PUSHING IN UNDER IT', reason: jaws ? 'the jaws hold the edge up; the legs push my head in under it' : 'the glass rests on me; the legs push my body in under it', detail };
+        case 'lie': return { action: 'LYING DOWN UNDER IT', reason: 'turning the front back onto my side', detail };
+        case 'roll': return { action: 'ROLLING ONTO MY BACK', reason: 'under the glass', detail };
+        case 'curl': return { action: 'CURLING UP UNDER IT', reason: 'the glass lies on me', detail };
+        case 'set': { const sh = setter.short(); return { action: 'SETTING THE GLASS', reason: 'the ' + (sh.where || 'body') + ' is short of glass — working it round with the legs', detail }; }
+        case 'covered': return { action: 'COVERED', reason: 'lying curled on my ' + lie + ' under the glass, covered all round', detail };
+      }
+      return { action: 'GIVING UP', reason: 'this glass never covered me', detail };
+    },
+    done() {
+      if (state === 'covered') return { ok: true, why: 'got under the glass and lies covered under it' };
+      if (state === 'give-up') return { ok: false, why: 'under the glass but could not get covered' };
+      if (t > 300) return { ok: false, why: 'not under a glass after 300 s' };
+      return null;
+    },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), delta: +body.delta.toFixed(5),
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, G: glassSnap(W_, g), state, rho: body.rho,
+        course: (state === 'push' || state === 'jaws') ? course : null, skipChecks: false };
+    },
+    invariants: [
+      { name: 'joints', check: (a, b) => {
+        if (Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG) return 'tail–middle bent past ' + JOINT.BEND + '°';
+        const hl = body.headLim(b.delta >= 0 ? 1 : -1) + 0.5 * DEG;
+        return Math.abs(b.delta) > hl ? 'head bent past its limit' : null; } },
+      { name: 'course', check: (a, b) => (b.course !== null && Math.abs(wrap(b.psi - b.course)) > 1e-6) ? 'turned off course while getting under' : null },
+      { name: 'glass jump', check: (a, b) => b.G.v > 60 ? 'the glass moves at ' + b.G.v.toFixed(1) + ' cm/s' : null }
+    ],
+    // lifting and pushing are pressing on purpose: the body does not stop for the pressure then
+    keepWorking() { return state === 'jaws'; },
+    pointer() { return false; },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      drawGlassPhys(ctx, W, H, W_, g, body, { label: 'glass cut along the body\'s axis' });
+      if (jaws) { ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(X(jaws.x), Y(jaws.y), 2.5, 0, 2 * Math.PI); ctx.fill(); }
+    }
+  };
+}
+
+// outline of a set of points (the glass is convex, so its top view is the hull of both faces)
+function convexHull(pts) {
+  const p = pts.slice().sort((a, b) => a.x - b.x || a.y - b.y), cr = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lo = [], hi = [];
+  for (const q of p) { while (lo.length > 1 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
+  for (let i = p.length - 1; i >= 0; i--) { const q = p[i]; while (hi.length > 1 && cr(hi[hi.length - 2], hi[hi.length - 1], q) <= 0) hi.pop(); hi.push(q); }
+  return lo.slice(0, -1).concat(hi.slice(0, -1));
+}
+
+/* ---------------- drawing: lines on white ---------------- */
+function X(x) { return x * PX; }
+function Y(y) { return (ARENA.H - y) * PX; }
+
+function drawFloor(ctx, W, H) {
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, W - 1, H - 1);
+  ctx.beginPath(); ctx.moveTo(14, H - 14); ctx.lineTo(14 + PX, H - 14);
+  ctx.moveTo(14, H - 18); ctx.lineTo(14, H - 10); ctx.moveTo(14 + PX, H - 18); ctx.lineTo(14 + PX, H - 10); ctx.stroke();
+  ctx.fillStyle = '#000'; ctx.font = '11px Helvetica, Arial, sans-serif'; ctx.fillText('1 cm', 14, H - 22);
+}
+
+function capsule(ctx, a, b, r, dashed) {
+  const ang = Math.atan2(-(b.y - a.y), b.x - a.x);
+  const ax = X(a.x), ay = Y(a.y), bx = X(b.x), by = Y(b.y), R = r * PX;
+  ctx.beginPath();
+  ctx.arc(bx, by, R, ang - Math.PI / 2, ang + Math.PI / 2);
+  ctx.arc(ax, ay, R, ang + Math.PI / 2, ang + 3 * Math.PI / 2);
+  ctx.closePath();
+  ctx.setLineDash(dashed ? [3, 3] : []);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawScene(ctx, W, H, body, target, trail) {
+  drawFloor(ctx, W, H);
+  if (trail.length > 1) {
+    ctx.strokeStyle = '#bbb'; ctx.lineWidth = 1; ctx.beginPath();
+    trail.forEach((p, i) => (i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y))));
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+  if (target) {
+    ctx.beginPath(); ctx.arc(X(target.x), Y(target.y), TARGET_R * PX, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(X(target.x) - 5, Y(target.y)); ctx.lineTo(X(target.x) + 5, Y(target.y));
+    ctx.moveTo(X(target.x), Y(target.y) - 5); ctx.lineTo(X(target.x), Y(target.y) + 5); ctx.stroke();
+  }
+
+  const p = body.points();
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1.3;
+  capsule(ctx, p.TM, p.tailEnd, tailHalfW(body), body.lam > 1 * DEG);   // dashed = lifted off the floor
+  capsule(ctx, p.TM, p.MH, BODY.MID_D / 2, false);
+  ctx.beginPath(); ctx.arc(X(p.head.x), Y(p.head.y), BODY.HEAD_D / 2 * PX, 0, 2 * Math.PI); ctx.stroke();
+
+  // legs: ticks on the side they face, as long as they reach out sideways;
+  // dots when they face up (on the back, or midway through a roll)
+  const u = body.u(), rr = { x: u.y, y: -u.x };
+  const side = Math.cos(body.rho), up = Math.sin(body.rho);
+  ctx.fillStyle = '#000';
+  for (let i = 1; i <= 3; i++) {
+    const t = i / 4, c = { x: p.TM.x + u.x * BODY.MID_LEN * t, y: p.TM.y + u.y * BODY.MID_LEN * t };
+    if (Math.abs(side) > 0.2) {
+      const s = Math.sign(side), r0 = BODY.MID_D / 2 * Math.abs(side), r1 = r0 + 0.14 * Math.abs(side);
+      ctx.beginPath();
+      ctx.moveTo(X(c.x + rr.x * s * r0), Y(c.y + rr.y * s * r0));
+      ctx.lineTo(X(c.x + rr.x * s * r1), Y(c.y + rr.y * s * r1));
+      ctx.stroke();
+    }
+    if (up > 0.5) { ctx.beginPath(); ctx.arc(X(c.x + rr.x * side * 0.1), Y(c.y + rr.y * side * 0.1), 1.6, 0, 2 * Math.PI); ctx.fill(); }
+    // legs underneath, pressed to the floor: small open rings
+    if (up < -0.5) { ctx.beginPath(); ctx.arc(X(c.x), Y(c.y), 2.2, 0, 2 * Math.PI); ctx.stroke(); }
+  }
+  drawSideView(ctx, W, H, body);
+}
+
+// a small view from the side: shows what the top view cannot — the tail off the floor
+function drawSideView(ctx, W, H, body) {
+  const bw = 230, bh = 110, x0 = W - bw - 10, y0 = 10, K = 36;
+  ctx.fillStyle = '#fff'; ctx.fillRect(x0, y0, bw, bh);
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1);
+  // nothing drawn in the side view may spill out of its box
+  ctx.save(); ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, bh - 2); ctx.clip();
+  const fy = y0 + bh - 14, ox = x0 + 130;
+  ctx.beginPath(); ctx.moveTo(x0 + 6, fy); ctx.lineTo(x0 + bw - 6, fy); ctx.stroke();
+  const sx = v => ox + v * K, sy = z => fy - z * K;
+  const seg = (ax, az, bx, bz, r, dashed) => {
+    const ang = Math.atan2(-(bz - az), bx - ax);
+    ctx.beginPath();
+    ctx.arc(sx(bx), sy(bz), r * K, ang - Math.PI / 2, ang + Math.PI / 2);
+    ctx.arc(sx(ax), sy(az), r * K, ang + Math.PI / 2, ang + 3 * Math.PI / 2);
+    ctx.closePath(); ctx.setLineDash(dashed ? [3, 3] : []); ctx.stroke(); ctx.setLineDash([]);
+  };
+  ctx.lineWidth = 1.2;
+  const hr = BODY.HEAD_D / 2;
+  if (body.phys) {
+    // the skin as the solver has it, seen from the side across the middle's axis:
+    // its upper and lower outline (a pressed tail shows lower here)
+    const u = body.u(), pts = body.phys.world.skinPoints(body.phys.larva), bins = new Map(), BIN = 0.04;
+    for (const q of pts) {
+      const a2 = (q.x - body.x) * u.x + (q.y - body.y) * u.y, k = Math.round(a2 / BIN);
+      const e = bins.get(k), lo = q.z - Physics.VR, hi = q.z + Physics.VR;   // each skin point is a small ball
+      if (!e) bins.set(k, { lo, hi }); else { e.lo = Math.min(e.lo, lo); e.hi = Math.max(e.hi, hi); }
+    }
+    const ks = [...bins.keys()].sort((a2, b2) => a2 - b2);
+    if (ks.length) {
+      ctx.beginPath();
+      ks.forEach((k, i) => { const e = bins.get(k); i ? ctx.lineTo(sx(k * BIN), sy(e.hi)) : ctx.moveTo(sx(k * BIN), sy(e.hi)); });
+      for (let i = ks.length - 1; i >= 0; i--) { const e = bins.get(ks[i]); ctx.lineTo(sx(ks[i] * BIN), sy(e.lo)); }
+      ctx.closePath(); ctx.stroke();
+    }
+    const hp = body.phys.world.headPoint(body.phys.larva), ha = (hp.x - body.x) * u.x + (hp.y - body.y) * u.y;
+    ctx.beginPath(); ctx.arc(sx(ha), sy(hp.z), hr * K, 0, 2 * Math.PI); ctx.stroke();
+  } else {
+    const zT = tailHalfH(body);
+    seg(0, BODY.MID_D / 2, BODY.MID_LEN, BODY.MID_D / 2, BODY.MID_D / 2, false);
+    const tx = -BODY.TAIL_LEN * Math.cos(body.lam) * Math.cos(body.beta), tz = zT + BODY.TAIL_LEN * Math.sin(body.lam);
+    seg(0, zT, tx, tz, zT, body.lam > 1 * DEG);
+    // the head hangs off the front of the middle, tilted up: it does not touch the ground
+    const hx = BODY.MID_LEN + hr * Math.cos(body.headLift) * Math.cos(body.delta);
+    const hz = BODY.MID_D / 2 + hr * Math.sin(body.headLift);
+    ctx.beginPath(); ctx.arc(sx(hx), sy(hz), hr * K, 0, 2 * Math.PI); ctx.stroke();
+  }
+  ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
+  ctx.fillText('side view · tail lift ' + (body.lam / DEG).toFixed(0) + '°', x0 + 6, y0 + 12);
+  ctx.restore();
+  // the body seen end-on from behind, in its own box: which way the legs point
+  const bx0 = x0, by0 = y0 + bh + 6, bs = 84;
+  ctx.fillStyle = '#fff'; ctx.fillRect(bx0, by0, bs, bs);
+  ctx.strokeRect(bx0 + 0.5, by0 + 0.5, bs - 1, bs - 1);
+  const ef = by0 + bs - 14, er = BODY.MID_D / 2 * K, ex = bx0 + bs / 2, ey = ef - er;
+  ctx.beginPath(); ctx.moveTo(bx0 + 6, ef); ctx.lineTo(bx0 + bs - 6, ef); ctx.stroke();
+  ctx.beginPath(); ctx.arc(ex, ey, er, 0, 2 * Math.PI); ctx.stroke();
+  const lx = Math.cos(body.rho), lz = Math.sin(body.rho);
+  ctx.beginPath(); ctx.moveTo(ex + lx * er, ey - lz * er); ctx.lineTo(ex + lx * (er + 9), ey - lz * (er + 9)); ctx.stroke();
+  // where the tail's own legs-side points, when the front is twisted against it
+  if (body.rhoTail !== undefined && Math.abs(body.rhoTail - body.rho) > 2 * DEG) {
+    const tx = Math.cos(body.rhoTail), tz = Math.sin(body.rhoTail);
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.arc(ex, ey, er + 3, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ex + tx * (er + 3), ey - tz * (er + 3)); ctx.lineTo(ex + tx * (er + 11), ey - tz * (er + 11)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.fillStyle = '#000';
+  ctx.fillText('from behind', bx0 + 6, by0 + 12);
+  if (lz < -0.5) ctx.fillText('legs', ex + er + 4, ef - 2);
+  else ctx.fillText('legs', ex + lx * (er + 12) - 9, ey - lz * (er + 12) + 3);
+  if (body.rhoTail !== undefined && Math.abs(body.rhoTail - body.rho) > 2 * DEG) ctx.fillText('- - tail', bx0 + 6, by0 + 24);
+}
+
+/* ---------------- the page ---------------- */
+if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
+  document.getElementById('bench-host').innerHTML =
+    '<p style="padding:24px;max-width:560px;font-size:15px">Не найден файл <b>harness.js</b>. ' +
+    'Он должен лежать в той же папке, что и skill-bench.html (в репозитории — в корне, рядом). ' +
+    'Без него стенду нечем управлять: кнопки, время и журнал живут там.</p>';
+} else if (typeof document !== 'undefined') {
+  // the solver first (Jolt, WebAssembly); then the bench. Several cores where the
+  // page is allowed to run threads (cross-origin isolated), else one.
+  const host = document.getElementById('bench-host');
+  const say = msg => { host.innerHTML = '<p style="padding:24px;max-width:560px;font-size:15px">' + msg + '</p>'; };
+  say('Загружаю физический движок Jolt…');
+  const iso = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated;
+  const JOLT_ONE = 'https://cdn.jsdelivr.net/npm/jolt-physics@1.1.0/dist/jolt-physics.wasm-compat.js';
+  const JOLT_MANY = new URL('jolt-physics.multithread.wasm-compat.js', location.href).href;
+  const load = url => import(url).then(m => { globalThis.JoltFactory = m.default; return Physics.load(); });
+  (iso ? load(JOLT_MANY).then(() => { Physics.threads = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 2) - 1)); }).catch(() => load(JOLT_ONE)) : load(JOLT_ONE))
+    .then(() => { host.innerHTML = ''; startBench(); })
+    .catch(e => say('Не загрузился физический движок Jolt: ' + (e && e.message || e) + '. Проверь интернет и обнови страницу.'));
+}
+function startBench() {
+  Harness.mount({
+    host: document.getElementById('bench-host'),
+    title: 'LARVAE — skill bench, one larva, on the Jolt solver',
+    page: 'skill-bench-jolt.html',
+    factory: SkillBench,
+    schema: SCHEMA,
+    canvas: { width: ARENA.W * PX, height: ARENA.H * PX },
+    extra(box) {
+      const rows = [
+        ['tail', BODY.TAIL_LEN + ' × ' + BODY.TAIL_D + ' cm, 0.49 g, soft'],
+        ['middle (legs, jaws not drawn)', BODY.MID_LEN + ' × ' + BODY.MID_D + ' cm, 0.23 g, soft'],
+        ['head', '⌀ ' + BODY.HEAD_D + ' cm, 0.07 g, hard'],
+        ['tail–middle joint', JOINT.BEND + '° in any direction — enough for the hook in the drawing'],
+        ['head', 'toward the chest (legs) up to ' + JOINT.HEAD_LEGS + '°, toward the back up to ' + JOINT.HEAD_BACK + '°; on the back up to ' + JOINT.HEAD_LEGS + '° either side'],
+        ['both joints, twist', JOINT.TWIST + '° — front twisted under; rolling over the back'],
+        ['stroke', GAIT.STROKE_S + ' s, ' + GAIT.STEP * 10 + ' mm, tail lifted ' + GAIT.LIFT + '° while it swings'],
+        ['tail on a side', 'curled toward the legs every stroke, ' + GAIT.SWEEP_SIDE + '°'],
+        ['tail on the back', 'bent to one side ' + GAIT.SWEEP_BACK + '°, pushes on the floor down to ' + GAIT.BACK_MIN + '°, lifts, bends again; ' + GAIT.BOUT_MIN + '–' + GAIT.BOUT_MAX + ' strokes one side, then the other (video)'],
+        ['roll over the back', 'curled ' + ROLL.CURL + '° toward the legs → straightens, tail up ' + ROLL.TAIL_UP + '° → back → other side → curls up, tail up ' + ROLL.TAIL_UP + '°; ' + (ROLL.STRAIGHTEN + ROLL.ROLL + ROLL.CURL_S) + ' s, on the spot'],
+        ['head on the back', 'bends to the tail\'s side by ' + Math.round(GAIT.BACK_C * 100) + '% of the tail\'s bend: the body is a C'],
+        ['turning', 'the body follows its middle; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s; the head only sways ±' + GAIT.SCAN + '°, scanning'],
+        ['head', 'held up ' + GAIT.HEAD_LIFT + '° off the ground, sweeping ±' + GAIT.SCAN + '° once a stroke']
+      ];
+      box.innerHTML = '<details><summary>Body</summary><table class="bench-table">' +
+        rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('') +
+        '</table><p class="hz-mute">Top view: dashed tail = lifted off the floor. Ticks on the middle = the side the legs face; dots = legs facing up (on the back). Click the floor to move the target; drag the larva to move it, wheel over it to turn it.</p></details>';
+    }
+  });
+}
+if (typeof module !== 'undefined') module.exports = { SkillBench, SCHEMA, makeBody };
+</script>
+</body>
+</html>
