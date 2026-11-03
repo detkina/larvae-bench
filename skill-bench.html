@@ -56,8 +56,13 @@ const BODY = {
    The one number is the least that allows every pose on the list:
    the hook (drawing: tail folded about 110° to the middle). */
 const JOINT = {
-  BEND: 120,    // deg, any direction: toward the legs, the back, either side, up
-  TWIST: 90     // deg: fore-body twisted under itself legs first; rolling over the back
+  BEND: 120,    // tail–middle, deg, any direction: toward the legs, the back, either side, up
+  TWIST: 90,    // deg: fore-body twisted under itself legs first; rolling over the back
+  // The head is not the tail: it bends a little toward the chest, where the
+  // legs are, and only just tilts back toward the back. On the back the same
+  // two limits are its left and right.
+  HEAD_LEGS: 40,   // deg, toward the chest / legs
+  HEAD_BACK: 10    // deg, toward the back
 };
 
 /* ---------------- BODY: gait (measured from video) ---------------- */
@@ -75,8 +80,8 @@ const GAIT = {
   LIFT: 20,            // tail lift while it swings, deg
   HEAD_LIFT: 30,       // the head is held up off the ground, never laid on it, deg
   SCAN: 12,            // the head keeps sweeping side to side, ± deg, once a stroke
-  HEAD_STEER: 15,      // on the back: the head stays almost on the body axis, deg
-  FRONT_SWING: 30,     // on the back: between pushes the front swings round at most this fast, deg/s
+  HEAD_STEER: 15,      // the head points toward the target by at most this much, deg
+  FRONT_SWING: 30,     // between pushes the front swings round at most this fast, deg/s
   TEMPO_SPREAD: 0.15,  // individual tempo ±15 %
   HEAD_RATE: 40        // the head turns smoothly, at most this fast, deg/s
 };
@@ -134,28 +139,36 @@ function makeBody(posture, rnd) {
     const vx = MH.x - b.x, vy = MH.y - b.y, L = Math.hypot(vx, vy);
     b.x = MH.x - vx / L * BODY.MID_LEN; b.y = MH.y - vy / L * BODY.MID_LEN;
     b.psi = Math.atan2(vy, vx);
-    b.delta = wrap(b.psi - headAngle);
+    b.delta = b.clampHead(wrap(b.psi - headAngle));
     b.travelled += ds;
   }
+
+  // head limits in the floor plane, + = head to the right of the middle's axis
+  b.headLim = sgn => {
+    // on the back, left and right are sideways for the head: the chest limit both ways
+    if (P.legs === 0) return JOINT.HEAD_LEGS * DEG;
+    return (sgn === P.legs ? JOINT.HEAD_LEGS : JOINT.HEAD_BACK) * DEG;
+  };
+  b.clampHead = a => clamp(a, -b.headLim(-1), b.headLim(1));
 
   // one tick. cmd = {go, aim}: aim is the wanted head bend, + = right
   b.step = function (dt, cmd) {
     // the head never rests: it sweeps side to side while the larva is on the move
     if (cmd.go) b.scanPhase += 2 * Math.PI * dt * b.tempo / GAIT.STROKE_S;
     const scan = cmd.go ? GAIT.SCAN * DEG * Math.sin(b.scanPhase) : 0;
-    // on the back the head stays almost on the body axis; on a side it turns to the target
-    const steerMax = P.legs === 0 ? GAIT.HEAD_STEER * DEG : BEND;
-    const steer = clamp(cmd.aim || 0, -steerMax, steerMax);
+    // the head points a little toward the target, within its own limits;
+    // the turning itself is done by swinging the front round (below)
+    const steer = clamp(cmd.aim || 0, -GAIT.HEAD_STEER * DEG, GAIT.HEAD_STEER * DEG);
     // on the back the whole body is a C: the head follows the tail's side
     const cBend = P.legs === 0 ? GAIT.BACK_C * b.beta : 0;
-    const want = clamp(steer + scan + cBend, -BEND, BEND);
+    const want = b.clampHead(steer + scan + cBend);
     const rate = GAIT.HEAD_RATE * DEG * dt;
     b.delta += clamp(wrap(want - b.delta), -rate, rate);
 
-    // On the back: between pushes the front is swung round toward the target, the
-    // whole body pivoting at the tail–middle joint. During a push the front goes straight.
+    // Between pushes the front is swung round toward the target, the whole body
+    // pivoting at the tail–middle joint. During a push the front goes straight.
     const pushingNow = b.inStroke && !b.halted && b.f >= 0.45 && b.f < 0.95;
-    if (P.legs === 0 && cmd.go && !pushingNow) {
+    if (cmd.go && !pushingNow) {
       const turn = clamp(cmd.aim || 0, -GAIT.FRONT_SWING * DEG * dt, GAIT.FRONT_SWING * DEG * dt);
       b.psi = wrap(b.psi - turn);
     }
@@ -325,9 +338,7 @@ const SkillBench = {
         const deg = Math.abs(off) / DEG;
         const side = body.sideWord(off > 0 ? 1 : -1);
         const reason = deg < 10 ? 'target straight ahead — head pointing at it'
-          : body.legs === 0 ? 'target off toward ' + side + ' — swinging the front round between pushes'
-          : Math.abs(off) > body.BEND ? 'target behind, toward ' + side + ' — head bent as far as the joint goes'
-          : 'target off toward ' + side + ' — head turned to it';
+          : 'target off toward ' + side + ' — swinging the front round between pushes';
         return { action: 'CRAWLING TO TARGET', reason,
           detail: 'target ' + dist.toFixed(1) + ' cm, ' + deg.toFixed(0) + '° off the body axis · ' + detail };
       },
@@ -360,7 +371,8 @@ const SkillBench = {
         { name: 'joints', check: (a, b) => {
           const lim = JOINT.BEND * DEG + 0.5 * DEG;
           if (Math.abs(b.beta) > lim) return 'tail–middle bent ' + (Math.abs(b.beta) / DEG).toFixed(1) + '°, the joint allows ' + JOINT.BEND + '°';
-          if (Math.abs(b.delta) > lim) return 'middle–head bent ' + (Math.abs(b.delta) / DEG).toFixed(1) + '°, the joint allows ' + JOINT.BEND + '°';
+          const hl = body.headLim(b.delta >= 0 ? 1 : -1) + 0.5 * DEG;
+          if (Math.abs(b.delta) > hl) return 'head bent ' + (Math.abs(b.delta) / DEG).toFixed(1) + '°, it bends at most ' + Math.round((hl / DEG) - 0.5) + '° that way';
           if (b.lam < -1e-9 || b.lam > lim) return 'tail lift ' + (b.lam / DEG).toFixed(1) + '° out of range';
           return null; } },
         { name: 'ground law', check: (a, b) => {
@@ -775,14 +787,15 @@ if (typeof document !== 'undefined' && typeof Harness === 'undefined') {
         ['tail', BODY.TAIL_LEN + ' × ' + BODY.TAIL_D + ' cm, 0.49 g, soft'],
         ['middle (legs, jaws not drawn)', BODY.MID_LEN + ' × ' + BODY.MID_D + ' cm, 0.23 g, soft'],
         ['head', '⌀ ' + BODY.HEAD_D + ' cm, 0.07 g, hard'],
-        ['both joints, bend', JOINT.BEND + '° in any direction — enough for the hook in the drawing'],
+        ['tail–middle joint', JOINT.BEND + '° in any direction — enough for the hook in the drawing'],
+        ['head', 'toward the chest (legs) up to ' + JOINT.HEAD_LEGS + '°, toward the back up to ' + JOINT.HEAD_BACK + '°; on the back up to ' + JOINT.HEAD_LEGS + '° either side'],
         ['both joints, twist', JOINT.TWIST + '° — front twisted under; rolling over the back'],
         ['stroke', GAIT.STROKE_S + ' s, ' + GAIT.STEP * 10 + ' mm, tail lifted ' + GAIT.LIFT + '° while it swings'],
         ['tail on a side', 'curled toward the legs every stroke, ' + GAIT.SWEEP_SIDE + '°'],
         ['tail on the back', 'bent to one side ' + GAIT.SWEEP_BACK + '°, pushes on the floor down to ' + GAIT.BACK_MIN + '°, lifts, bends again; ' + GAIT.BOUT_MIN + '–' + GAIT.BOUT_MAX + ' strokes one side, then the other (video)'],
         ['roll over the back', 'curled ' + ROLL.CURL + '° toward the legs → straightens, tail up ' + ROLL.TAIL_UP + '° → back → other side → curls up, tail up ' + ROLL.TAIL_UP + '°; ' + (ROLL.STRAIGHTEN + ROLL.ROLL + ROLL.CURL_S) + ' s, on the spot'],
         ['head on the back', 'bends to the tail\'s side by ' + Math.round(GAIT.BACK_C * 100) + '% of the tail\'s bend: the body is a C'],
-        ['turning on the back', 'head within ±' + GAIT.HEAD_STEER + '° of the body axis; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s'],
+        ['turning', 'head points within ±' + GAIT.HEAD_STEER + '° toward the target; the front swings round between pushes, up to ' + GAIT.FRONT_SWING + '°/s, on a side and on the back'],
         ['head', 'held up ' + GAIT.HEAD_LIFT + '° off the ground, sweeping ±' + GAIT.SCAN + '° once a stroke']
       ];
       box.innerHTML = '<details><summary>Body</summary><table class="bench-table">' +
