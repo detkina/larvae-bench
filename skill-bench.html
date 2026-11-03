@@ -254,8 +254,8 @@ const SKILLS = [
   { value: 'ring-r',  label: 'Curl on the right side, crawl round, push aside (next)', disabled: true },
   { value: 'tail-l',  label: 'On the left side: tail toward the legs, the back, up', kind: 'poses', posture: 'left' },
   { value: 'tail-r',  label: 'On the right side: tail toward the legs, the back, up', kind: 'poses', posture: 'right' },
-  { value: 'fore-l',  label: 'On the left side: front twisted legs under (next)', disabled: true },
-  { value: 'fore-r',  label: 'On the right side: front twisted legs under (next)', disabled: true }
+  { value: 'fore-l',  label: 'On the left side: front twisted, legs down', kind: 'fore', posture: 'left' },
+  { value: 'fore-r',  label: 'On the right side: front twisted, legs down', kind: 'fore', posture: 'right' }
 ];
 
 const SCHEMA = [
@@ -269,7 +269,11 @@ const SCHEMA = [
   { key: 'toBack', label: 'Tail poses: toward the back', type: 'number', min: 0, max: 120, step: 5, value: 30, unit: '°',
     hint: 'Tail–middle bend toward the back, along the floor.' },
   { key: 'up', label: 'Tail poses: up off the bowl', type: 'number', min: 0, max: 120, step: 5, value: 45, unit: '°',
-    hint: 'Tail lifted off the floor, lying on a side.' }
+    hint: 'Tail lifted off the floor, lying on a side.' },
+  { key: 'foreCurl', label: 'Front twist: tail bend before', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
+    hint: 'Tail bent toward the legs as the larva lies on its side before the twist.' },
+  { key: 'foreEase', label: 'Front twist: tail unbends by', type: 'number', min: 0, max: 60, step: 5, value: 30, unit: '°',
+    hint: 'While the front turns legs down, the tail straightens a little by this much.' }
 ];
 
 const SkillBench = {
@@ -277,6 +281,7 @@ const SkillBench = {
     const skill = SKILLS.find(s => s.value === params.skill);
     if (skill.kind === 'roll') return createRoll(skill, rng, params.curl);
     if (skill.kind === 'poses') return createPoses(skill, rng, params);
+    if (skill.kind === 'fore') return createFore(skill, rng, params);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -556,6 +561,81 @@ function createPoses(skill, rng, params) {
   };
 }
 
+
+/* ---------------- FRONT TWISTED, LEGS DOWN, on a side ----------------
+   As described: lying on a side, the head and the middle turn together about
+   the body's long axis by 90°, until the legs face down into the floor; while
+   they turn, the tail straightens a little. The whole body stays at floor
+   level. This is the in-between pose for going down a slope; the tilt down
+   that follows needs a slope and comes later. The tail stays on its side. */
+const FORE = { HOLD: 1.0, TWIST_S: 1.5, KEEP: 2.0 };   // s
+
+function createFore(skill, rng, params) {
+  const rL = rng('larva');
+  const body = makeBody(skill.posture, rL);
+  body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
+  body.y = rL.range(ARENA.H * 0.4, ARENA.H * 0.6);
+  body.psi = rL.range(-Math.PI, Math.PI);
+  const legs = POSTURES[skill.posture].legs;
+  const rhoSide = body.rho;                      // 0 on the left side, 180° on the right
+  const rhoDown = (skill.posture === 'left' ? -90 : 270) * DEG;   // legs into the floor
+  body.rhoTail = rhoSide;                        // the tail stays lying on its side
+  const curl = params.foreCurl * DEG, eased = Math.max(0, params.foreCurl - params.foreEase) * DEG;
+  const t1 = FORE.HOLD, t2 = t1 + FORE.TWIST_S, t3 = t2 + FORE.KEEP, t4 = t3 + FORE.TWIST_S, t5 = t4 + FORE.HOLD;
+  const start = { x: body.x, y: body.y };
+  let t = 0, phase = 'side';
+
+  function pose() {
+    let a;
+    if (t < t1) { a = 0; phase = 'side'; }
+    else if (t < t2) { a = smooth((t - t1) / FORE.TWIST_S); phase = 'twist'; }
+    else if (t < t3) { a = 1; phase = 'hold'; }
+    else if (t < t4) { a = 1 - smooth((t - t3) / FORE.TWIST_S); phase = 'untwist'; }
+    else { a = 0; phase = t < t5 ? 'back' : 'done'; }
+    body.rho = rhoSide + (rhoDown - rhoSide) * a;
+    body.beta = legs * (curl + (eased - curl) * a);
+    body.lam = 0; body.delta = 0;
+  }
+  pose();
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; pose(); },
+    status() {
+      const tw = Math.round(Math.abs(body.rho - rhoSide) / DEG);
+      const detail = 'on its ' + body.label + ' · front turned ' + tw + '° of 90° · tail bent ' + Math.abs(Math.round(body.beta / DEG)) + '° toward the legs';
+      switch (phase) {
+        case 'side': return { action: 'LYING ON THE SIDE', reason: 'curled toward the legs', detail };
+        case 'twist': return { action: 'TWISTING THE FRONT', reason: 'head and middle turning legs down, tail easing a little', detail };
+        case 'hold': return { action: 'FRONT TWISTED, LEGS DOWN', reason: 'the in-between pose for going down a slope', detail };
+        case 'untwist': return { action: 'TURNING THE FRONT BACK', reason: 'back onto the side, tail curling again', detail };
+      }
+      return { action: 'LYING ON THE SIDE', reason: 'front turned back', detail };
+    },
+    done() { return t >= t5 ? { ok: true, why: 'twisted the front legs down and back, on the spot' } : null; },
+    snapshot() {
+      const p = body.points();
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: 0, delta: 0,
+        rho: +body.rho.toFixed(5), rhoTail: body.rhoTail,
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+        phase, pushing: false, skipChecks: false };
+    },
+    invariants: [
+      { name: 'twist', check: (a, b) => Math.abs(b.rho - b.rhoTail) > JOINT.TWIST * DEG + 0.5 * DEG
+        ? 'front twisted ' + Math.round(Math.abs(b.rho - b.rhoTail) / DEG) + '° against the tail, the joint allows ' + JOINT.TWIST + '°' : null },
+      { name: 'joints', check: (a, b) => Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG ? 'tail–middle bent past ' + JOINT.BEND + '°' : null },
+      { name: 'on the spot', check: (a, b) => {
+        const d = Math.hypot(b.x - start.x, b.y - start.y);
+        return d > 0.01 ? 'body moved ' + (d * 10).toFixed(1) + ' mm along the floor' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.tailEnd.x - a.tailEnd.x, b.tailEnd.y - a.tailEnd.y);
+        return d > 0.15 ? 'tail tip moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
+  };
+}
+
 /* ---------------- drawing: lines on white ---------------- */
 function X(x) { return x * PX; }
 function Y(y) { return (ARENA.H - y) * PX; }
@@ -616,6 +696,8 @@ function drawScene(ctx, W, H, body, target, trail) {
       ctx.stroke();
     }
     if (up > 0.5) { ctx.beginPath(); ctx.arc(X(c.x + rr.x * side * 0.1), Y(c.y + rr.y * side * 0.1), 1.6, 0, 2 * Math.PI); ctx.fill(); }
+    // legs underneath, pressed to the floor: small open rings
+    if (up < -0.5) { ctx.beginPath(); ctx.arc(X(c.x), Y(c.y), 2.2, 0, 2 * Math.PI); ctx.stroke(); }
   }
   drawSideView(ctx, W, H, body);
 }
@@ -659,9 +741,19 @@ function drawSideView(ctx, W, H, body) {
   ctx.beginPath(); ctx.arc(ex, ey, er, 0, 2 * Math.PI); ctx.stroke();
   const lx = Math.cos(body.rho), lz = Math.sin(body.rho);
   ctx.beginPath(); ctx.moveTo(ex + lx * er, ey - lz * er); ctx.lineTo(ex + lx * (er + 9), ey - lz * (er + 9)); ctx.stroke();
+  // where the tail's own legs-side points, when the front is twisted against it
+  if (body.rhoTail !== undefined && Math.abs(body.rhoTail - body.rho) > 2 * DEG) {
+    const tx = Math.cos(body.rhoTail), tz = Math.sin(body.rhoTail);
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.arc(ex, ey, er + 3, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ex + tx * (er + 3), ey - tz * (er + 3)); ctx.lineTo(ex + tx * (er + 11), ey - tz * (er + 11)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
   ctx.fillStyle = '#000';
   ctx.fillText('from behind', bx0 + 6, by0 + 12);
-  ctx.fillText('legs', ex + lx * (er + 12) - 9, ey - lz * (er + 12) + 3);
+  if (lz < -0.5) ctx.fillText('legs', ex + er + 4, ef - 2);
+  else ctx.fillText('legs', ex + lx * (er + 12) - 9, ey - lz * (er + 12) + 3);
+  if (body.rhoTail !== undefined && Math.abs(body.rhoTail - body.rho) > 2 * DEG) ctx.fillText('- - tail', bx0 + 6, by0 + 24);
 }
 
 /* ---------------- the page ---------------- */
