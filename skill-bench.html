@@ -262,7 +262,8 @@ const SKILLS = [
   { value: 'tail-l',  label: 'On the left side: tail toward the legs, the back, up', kind: 'poses', posture: 'left' },
   { value: 'tail-r',  label: 'On the right side: tail toward the legs, the back, up', kind: 'poses', posture: 'right' },
   { value: 'fore-l',  label: 'On the left side: front twisted, legs down', kind: 'fore', posture: 'left' },
-  { value: 'fore-r',  label: 'On the right side: front twisted, legs down', kind: 'fore', posture: 'right' }
+  { value: 'fore-r',  label: 'On the right side: front twisted, legs down', kind: 'fore', posture: 'right' },
+  { value: 'glass',   label: 'Reference glass over a curled larva', kind: 'glass', posture: 'left' }
 ];
 
 const SCHEMA = [
@@ -292,6 +293,7 @@ const SkillBench = {
     if (skill.kind === 'poses') return createPoses(skill, rng, params);
     if (skill.kind === 'fore') return createFore(skill, rng, params);
     if (skill.kind === 'ring') return createRing(skill, rng, params);
+    if (skill.kind === 'glass') return createGlassBench(skill, rng, params);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -861,6 +863,166 @@ function createRing(skill, rng, params) {
         if (o.live) { ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.arc(X(ox), Y(oy), o.r * PX + 4, 0, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]); }
         ctx.fillText(o.live ? 'alive' : 'stone', X(ox) - 12, Y(oy) - o.r * PX - 7);
       }
+      ctx.restore();
+    }
+  };
+}
+
+
+/* ---------------- REFERENCE GLASS ----------------
+   One fixed piece, built from the larva and nothing else: a polygon with
+   curved (outward-bulging) edges, 7 mm thick (lying on the floor, its top is
+   7 mm up), covering a curled larva from above with at least 2 mm to spare
+   beyond every point of it. Pure geometry:
+   no weight, no friction. The observer can drag it and turn it with the
+   wheel; the bench reports at once whether it still covers the larva. */
+const GLASS = {
+  THICK: 0.7,         // cm: the slab's thickness, i.e. its height off the floor when it lies flat
+  MARGIN: 0.2,        // cm: at least this much glass beyond every point of the larva
+  CURL: 110,          // deg: the curled larva it is made to cover (tail toward the legs)
+  HEAD_CURL: 40,      // deg: head bent toward the chest in the curl
+  // six edges at uneven directions, each bulging outward by its own amount (cm)
+  EDGES: [[0, 0.12], [52, 0.08], [121, 0.15], [178, 0.10], [233, 0.13], [297, 0.09]],
+  SLACK: 0.03         // cm: straight edges sit this far beyond the 2 mm line
+};
+
+// the curled larva as round parts (axis segment + radius), in its own frame
+function curledParts(body) {
+  const p = body.points();
+  return [
+    { a: p.TM, b: p.tailEnd, r: BODY.TAIL_D / 2 },
+    { a: p.TM, b: p.MH, r: BODY.MID_D / 2 },
+    { a: p.head, b: p.head, r: BODY.HEAD_D / 2 }
+  ];
+}
+
+// build the reference outline once, around a curled larva centred at the origin
+function makeReferenceGlass() {
+  const b = makeBody('left', { range: (a) => a, sign: () => 1, next: () => 0.5 });
+  b.x = 0; b.y = 0; b.psi = 0; b.lam = 0;
+  b.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  b.delta = b.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  const parts = curledParts(b);
+  // points of the larva's outline grown by the margin
+  const pts = [];
+  for (const pt of parts) for (let k = 0; k <= 20; k++) {
+    const t = k / 20, cx = pt.a.x + (pt.b.x - pt.a.x) * t, cy = pt.a.y + (pt.b.y - pt.a.y) * t;
+    for (let j = 0; j < 36; j++) { const a = j / 36 * 2 * Math.PI; pts.push({ x: cx + Math.cos(a) * (pt.r + GLASS.MARGIN), y: cy + Math.sin(a) * (pt.r + GLASS.MARGIN) }); }
+  }
+  // each edge is the supporting line in its direction, a little further out
+  const lines = GLASS.EDGES.map(([deg, bulge]) => {
+    const a = deg * DEG, n = { x: Math.cos(a), y: Math.sin(a) };
+    let h = -Infinity; for (const q of pts) h = Math.max(h, q.x * n.x + q.y * n.y);
+    return { n, h: h + GLASS.SLACK, bulge };
+  });
+  // corners: neighbouring edge lines meet
+  const corners = lines.map((L, i) => {
+    const M = lines[(i + 1) % lines.length], det = L.n.x * M.n.y - L.n.y * M.n.x;
+    return { x: (L.h * M.n.y - M.h * L.n.y) / det, y: (L.n.x * M.h - M.n.x * L.h) / det };
+  });
+  // each edge bows outward along a circular arc
+  const outline = [];
+  for (let i = 0; i < corners.length; i++) {
+    const A = corners[(i - 1 + corners.length) % corners.length], B = corners[i], L = lines[i];
+    for (let k = 0; k < 24; k++) {
+      const t = k / 24, bow = 4 * L.bulge * t * (1 - t);
+      outline.push({ x: A.x + (B.x - A.x) * t + L.n.x * bow, y: A.y + (B.y - A.y) * t + L.n.y * bow });
+    }
+  }
+  // centre the outline on its own centroid; keep the larva's place relative to it
+  let ax = 0, ay = 0, A2 = 0;
+  for (let i = 0, j = outline.length - 1; i < outline.length; j = i++) {
+    const f = outline[j].x * outline[i].y - outline[i].x * outline[j].y;
+    A2 += f; ax += (outline[j].x + outline[i].x) * f; ay += (outline[j].y + outline[i].y) * f;
+  }
+  const cx = ax / (3 * A2), cy = ay / (3 * A2);
+  return { local: outline.map(q => ({ x: q.x - cx, y: q.y - cy })), larvaAt: { x: -cx, y: -cy }, area: Math.abs(A2) / 2, corners: corners.length };
+}
+const REF_GLASS = makeReferenceGlass();
+
+function polyContains(poly, q) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+function polyEdgeDist(poly, q) {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[j], b = poly[i], vx = b.x - a.x, vy = b.y - a.y, L2 = vx * vx + vy * vy;
+    const t = L2 ? clamp(((q.x - a.x) * vx + (q.y - a.y) * vy) / L2, 0, 1) : 0;
+    best = Math.min(best, Math.hypot(q.x - a.x - t * vx, q.y - a.y - t * vy));
+  }
+  return best;
+}
+// least glass beyond any point of the larva (negative: some of the larva sticks out)
+function coverMargin(parts, poly) {
+  let m = Infinity;
+  for (const pt of parts) for (let k = 0; k <= 30; k++) {
+    const t = k / 30, q = { x: pt.a.x + (pt.b.x - pt.a.x) * t, y: pt.a.y + (pt.b.y - pt.a.y) * t };
+    const d = polyEdgeDist(poly, q);
+    m = Math.min(m, polyContains(poly, q) ? d - pt.r : -d - pt.r);
+  }
+  return m;
+}
+function longest(poly) { let L = 0; for (const a of poly) for (const b of poly) L = Math.max(L, Math.hypot(a.x - b.x, a.y - b.y)); return L; }
+
+function createGlassBench(skill, rng, params) {
+  const body = makeBody('left', rng('larva'));
+  body.psi = 0; body.lam = 0;
+  body.beta = POSTURES.left.legs * GLASS.CURL * DEG;
+  body.delta = body.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
+  const G = { x: ARENA.W / 2, y: ARENA.H / 2, rot: 0 };
+  body.x = G.x + REF_GLASS.larvaAt.x; body.y = G.y + REF_GLASS.larvaAt.y;
+  const world = () => {
+    const c = Math.cos(G.rot), s2 = Math.sin(G.rot);
+    return REF_GLASS.local.map(q => ({ x: G.x + q.x * c - q.y * s2, y: G.y + q.x * s2 + q.y * c }));
+  };
+  const span = longest(REF_GLASS.local);
+  let drag = null, t = 0;
+
+  return {
+    body, target: null,
+    step(dt) { t += dt; },
+    status() {
+      const m = coverMargin(curledParts(body), world());
+      const detail = REF_GLASS.corners + ' curved edges · ' + REF_GLASS.area.toFixed(1) + ' cm² · ' + (span * 10).toFixed(0) +
+        ' mm across · ' + GLASS.THICK * 10 + ' mm thick · turned ' + Math.round(G.rot / DEG) + '°';
+      if (m >= GLASS.MARGIN - 1e-3) return { action: 'COVERED', reason: 'glass reaches at least ' + (m * 10).toFixed(1) + ' mm beyond every point of the larva', detail };
+      if (m >= 0) return { action: 'COVERED, TOO CLOSE', reason: 'only ' + (m * 10).toFixed(1) + ' mm of glass beyond the larva at the nearest point', detail };
+      return { action: 'NOT COVERED', reason: 'the larva sticks out ' + (-m * 10).toFixed(1) + ' mm', detail };
+    },
+    done() { return null; },
+    snapshot() { return { G: { x: G.x, y: G.y, rot: G.rot }, margin: coverMargin(curledParts(body), world()), skipChecks: true }; },
+    invariants: [],
+    pointer(kind, px, py, extra) {
+      const w = { x: px / PX, y: ARENA.H - py / PX };
+      if (kind === 'down') { if (polyContains(world(), w)) drag = { dx: G.x - w.x, dy: G.y - w.y }; return true; }
+      if (kind === 'move' && drag) { G.x = w.x + drag.dx; G.y = w.y + drag.dy; return true; }
+      if (kind === 'up') { drag = null; return true; }
+      if (kind === 'wheel' && polyContains(world(), w)) { G.rot = wrap(G.rot + extra.delta * 5 * DEG); return true; }
+      return false;
+    },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      const poly = world(), m = coverMargin(curledParts(body), poly);
+      ctx.save();
+      ctx.beginPath(); poly.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
+      ctx.fillStyle = 'rgba(0,0,0,0.05)'; ctx.fill();
+      ctx.strokeStyle = m >= GLASS.MARGIN - 1e-3 ? '#000' : '#c00'; ctx.lineWidth = 1.4; ctx.stroke();
+      ctx.fillStyle = '#000'; ctx.font = '11px Helvetica, Arial, sans-serif';
+      ctx.fillText('drag the glass · wheel over it turns it', 14, 18);
+      // side view: the 7 mm slab, held over the curled larva on its back
+      const bw = 230, x0 = W - bw - 10, y0 = 10, K = 36, fy = y0 + 110 - 14, ox = x0 + 130;
+      const u = { x: Math.cos(body.psi), y: Math.sin(body.psi) };
+      let lo = Infinity, hi = -Infinity;
+      for (const q of poly) { const s3 = (q.x - body.x) * u.x + (q.y - body.y) * u.y; lo = Math.min(lo, s3); hi = Math.max(hi, s3); }
+      ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, 108); ctx.clip();
+      ctx.lineWidth = 1.2; ctx.strokeStyle = '#000';
+      const zb = BODY.TAIL_D;                     // the curled larva's back
+      ctx.strokeRect(ox + lo * K, fy - (zb + GLASS.THICK) * K, (hi - lo) * K, GLASS.THICK * K);
       ctx.restore();
     }
   };
