@@ -552,7 +552,7 @@
     W.nameOf = k => W.names.get(k) || ('body ' + (k & 0x7fffff));
     // reused per step, so stepping allocates nothing in the solver's memory
     const TMP = { r: new J.RVec3(), v: new J.Vec3(), q: J.Quat.prototype.sIdentity(), r2: new J.Vec3() };
-    W.tune = Object.assign({ springHz: 90, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
+    W.tune = Object.assign({ springHz: 90, pushHz: 15, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
     W.skinTouch = new Map();     // other body key → contacts with the larva's soft body this step
     // rigid contacts this step (the head, glasses, stones, floor): pairs of keys, depth, normal
     W.contacts = [];
@@ -608,6 +608,7 @@
       cs.mFriction = 0.6; cs.mRestitution = 0; cs.mLinearDamping = 0.2; cs.mAngularDamping = 0.4;
       cs.mMotionQuality = J.EMotionQuality_Discrete;
       cs.mUseManifoldReduction = false;     // keep every contact point: it rocks on its edges
+      cs.mAllowSleeping = false;            // never put to sleep: a glass balanced on an edge must fall over, not freeze there
       const body = bi.CreateBody(cs); bi.AddBody(body.GetID(), J.EActivation_Activate);
       J.destroy(cs);
       const g = { body, id: body.GetID(), local, thick };
@@ -668,7 +669,11 @@
         for (const ax of [J.SixDOFConstraintSettings_EAxis_TranslationX, J.SixDOFConstraintSettings_EAxis_TranslationY, J.SixDOFConstraintSettings_EAxis_TranslationZ,
           J.SixDOFConstraintSettings_EAxis_RotationX, J.SixDOFConstraintSettings_EAxis_RotationY, J.SixDOFConstraintSettings_EAxis_RotationZ]) {
           c6.SetLimitedAxis(ax, 0, 0);
-          const sp = c6.get_mLimitsSpringSettings(ax); sp.mFrequency = W.tune.springHz; sp.mDamping = 1;
+          // the segment's own frame: x is up and down (the anchor turns +Y onto the body's axis
+          // about a level line), y along the body, z sideways. It bears weight stiffly; pushing
+          // along or sideways, and twisting, its muscles give way sooner
+          const firm = ax === J.SixDOFConstraintSettings_EAxis_TranslationX;
+          const sp = c6.get_mLimitsSpringSettings(ax); sp.mFrequency = firm ? W.tune.springHz : W.tune.pushHz; sp.mDamping = 1;
         }
         const con = c6.Create(anchor, body); system.AddConstraint(con); J.destroy(c6);
         const seg = { body, anchor, s0, s1, r, len, isTail, shapes, flat: 0, key: body.GetID().GetIndexAndSequenceNumber(), placed: false };
@@ -854,7 +859,7 @@
       const shape = new J.CylinderShapeSettings(hh, r, 0.03).Create().Get();
       const cs = new J.BodyCreationSettings(shape, r3(x, hh, y), J.Quat.prototype.sIdentity(), live ? J.EMotionType_Kinematic : J.EMotionType_Dynamic, LAYER_MOVING);
       cs.mFriction = 0.8; cs.mRestitution = 0; cs.mLinearDamping = 0.5; cs.mAngularDamping = 0.8;
-      cs.mMotionQuality = J.EMotionQuality_LinearCast;
+      cs.mMotionQuality = J.EMotionQuality_LinearCast; cs.mAllowSleeping = false;
       if (!live) { cs.mOverrideMassProperties = J.EOverrideMassProperties_CalculateInertia; cs.mMassPropertiesOverride.mMass = 2.6 * Math.PI * r * r * 2 * hh; }
       const body = bi.CreateBody(cs); bi.AddBody(body.GetID(), J.EActivation_Activate); J.destroy(cs);
       const b = { body, id: body.GetID(), r, hh, live }; b.key = b.id.GetIndexAndSequenceNumber(); W.names.set(b.key, live ? 'the other larva' : 'a stone');
@@ -2152,7 +2157,7 @@ function drawGlassPhys(ctx, W, H, world, g, body, opts = {}) {
     const a = P3[i], b = P3[n + i], ax = (a.x - body.x) * u.x + (a.y - body.y) * u.y, bx = (b.x - body.x) * u.x + (b.y - body.y) * u.y;
     if (i % Math.max(1, Math.round(n / 3)) === 0) { ctx.beginPath(); ctx.moveTo(ox + ax * K, fy - a.z * K); ctx.lineTo(ox + bx * K, fy - b.z * K); ctx.stroke(); }
   }
-  ctx.strokeStyle = opts.color || '#000'; ctx.lineWidth = 1.2; ctx.setLineDash(opts.dashed ? [4, 3] : []);
+  ctx.strokeStyle = opts.thin ? '#888' : (opts.color || '#000'); ctx.lineWidth = opts.thin ? 1 : 1.2; ctx.setLineDash(opts.dashed ? [4, 3] : []);
   if (cut.length >= 3) {
     const hull = convexHull(cut);
     ctx.beginPath(); hull.forEach((q, i) => i ? ctx.lineTo(ox + q.x * K, fy - q.y * K) : ctx.moveTo(ox + q.x * K, fy - q.y * K)); ctx.closePath(); ctx.stroke();
@@ -2218,10 +2223,11 @@ function makeSetterPhys(body, ph, g) {
   S.release = () => ph.world.release(g);
   S.step = dt => {
     S.beat = (S.beat + dt) % TRY.BEAT;
-    // the legs feel it when the glass will not follow (it is up against something):
-    // they stop where the glass is instead of pushing on into it
+    // the legs feel it when the glass will not follow at all (it is up against
+    // something firm): they stop where the glass is instead of pushing on into it.
+    // Something loose (a glass standing on its edge) gives way to the push first.
     { const c = g.body.GetCenterOfMassPosition(), lag = Math.hypot(c.GetX() - G.x, c.GetZ() - G.y), turn = Math.abs(wrap(ph.world.glassAngle(g) - G.yaw));
-      if (lag > 0.08 || turn > 3 * DEG) { G.x = c.GetX(); G.y = c.GetZ(); G.yaw = ph.world.glassAngle(g); S.stuck = (S.stuck || 0) + 1; } }
+      if (lag > 0.3 || turn > 10 * DEG) { G.x = c.GetX(); G.y = c.GetZ(); G.yaw = ph.world.glassAngle(g); S.stuck = (S.stuck || 0) + 1; } }
     const hold = () => ph.world.moveGrip(g, G.x, G.y, G.yaw, dt);
     const poly = glassSeen(ph.world, g).out, now = coverShort(ph, poly);
     if (now.sum <= 1e-9) { hold(); return 'covered'; }
@@ -2308,7 +2314,11 @@ function createGlassTry(skill, rng, params) {
         // no longer held, slides off the body and falls by itself
         k += dt;
         if (!cur.letGo) { ph.world.release(cur.g); cur.letGo = true; body.headLift = GAIT.HEAD_LIFT * DEG; }
-        body.step(dt, { go: true, aim: 0 });
+        // it crawls out on the side away from the glass, so the glass slides down off it
+        { const c0 = cur.g.body.GetCenterOfMassPosition(), mid = body.points().MH, u = body.u();
+          const side = (c0.GetX() - body.x) * -u.y + (c0.GetZ() - body.y) * u.x;     // > 0: the glass is to the left
+          if (k < dt * 1.5) cur.away = side > 0 ? 1 : -1; }   // aim > 0 turns it to the right
+        body.step(dt, { go: true, aim: cur.away * 0.6 });
         const out = glassSeen(ph.world, cur.g).out;
         const onBody = larvaPoints(ph).some(q => polyContains(out, q) || polyEdgeDist(out, q) < 0.3);
         if ((!onBody && ph.world.glassSpeed(cur.g).v < 0.05 && !body.inStroke) || k > 60) { state = 'recurl'; k = 0; from = { beta: body.beta, delta: body.delta }; }
@@ -2363,7 +2373,7 @@ function createGlassTry(skill, rng, params) {
       drawScene(ctx, W, H, body, null, []);
       for (const sh of shapes) {
         const on = sh === cur && state !== 'off';
-        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { thin: !on, noSide: sh !== cur, label: 'glass on the back, cut along the body\'s axis' });
+        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { thin: !on, label: sh !== cur ? null : 'glass on the back, cut along the body\'s axis' });
         const poly = glassSeen(ph.world, sh.g).out; let top = -Infinity, left = Infinity; for (const q of poly) { top = Math.max(top, q.y); left = Math.min(left, q.x); }
         ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
         ctx.fillText(sh.name + (sh.rejected ? ' — let go' : sh === cur && state === 'keep' ? ' — kept' : on ? ' — on its back' : ' — on the floor'), X(left), Y(top) - 6);

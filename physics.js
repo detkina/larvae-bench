@@ -77,7 +77,7 @@
     W.nameOf = k => W.names.get(k) || ('body ' + (k & 0x7fffff));
     // reused per step, so stepping allocates nothing in the solver's memory
     const TMP = { r: new J.RVec3(), v: new J.Vec3(), q: J.Quat.prototype.sIdentity(), r2: new J.Vec3() };
-    W.tune = Object.assign({ springHz: 90, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
+    W.tune = Object.assign({ springHz: 90, pushHz: 15, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
     W.skinTouch = new Map();     // other body key → contacts with the larva's soft body this step
     // rigid contacts this step (the head, glasses, stones, floor): pairs of keys, depth, normal
     W.contacts = [];
@@ -133,6 +133,7 @@
       cs.mFriction = 0.6; cs.mRestitution = 0; cs.mLinearDamping = 0.2; cs.mAngularDamping = 0.4;
       cs.mMotionQuality = J.EMotionQuality_Discrete;
       cs.mUseManifoldReduction = false;     // keep every contact point: it rocks on its edges
+      cs.mAllowSleeping = false;            // never put to sleep: a glass balanced on an edge must fall over, not freeze there
       const body = bi.CreateBody(cs); bi.AddBody(body.GetID(), J.EActivation_Activate);
       J.destroy(cs);
       const g = { body, id: body.GetID(), local, thick };
@@ -193,7 +194,11 @@
         for (const ax of [J.SixDOFConstraintSettings_EAxis_TranslationX, J.SixDOFConstraintSettings_EAxis_TranslationY, J.SixDOFConstraintSettings_EAxis_TranslationZ,
           J.SixDOFConstraintSettings_EAxis_RotationX, J.SixDOFConstraintSettings_EAxis_RotationY, J.SixDOFConstraintSettings_EAxis_RotationZ]) {
           c6.SetLimitedAxis(ax, 0, 0);
-          const sp = c6.get_mLimitsSpringSettings(ax); sp.mFrequency = W.tune.springHz; sp.mDamping = 1;
+          // the segment's own frame: x is up and down (the anchor turns +Y onto the body's axis
+          // about a level line), y along the body, z sideways. It bears weight stiffly; pushing
+          // along or sideways, and twisting, its muscles give way sooner
+          const firm = ax === J.SixDOFConstraintSettings_EAxis_TranslationX;
+          const sp = c6.get_mLimitsSpringSettings(ax); sp.mFrequency = firm ? W.tune.springHz : W.tune.pushHz; sp.mDamping = 1;
         }
         const con = c6.Create(anchor, body); system.AddConstraint(con); J.destroy(c6);
         const seg = { body, anchor, s0, s1, r, len, isTail, shapes, flat: 0, key: body.GetID().GetIndexAndSequenceNumber(), placed: false };
@@ -379,7 +384,7 @@
       const shape = new J.CylinderShapeSettings(hh, r, 0.03).Create().Get();
       const cs = new J.BodyCreationSettings(shape, r3(x, hh, y), J.Quat.prototype.sIdentity(), live ? J.EMotionType_Kinematic : J.EMotionType_Dynamic, LAYER_MOVING);
       cs.mFriction = 0.8; cs.mRestitution = 0; cs.mLinearDamping = 0.5; cs.mAngularDamping = 0.8;
-      cs.mMotionQuality = J.EMotionQuality_LinearCast;
+      cs.mMotionQuality = J.EMotionQuality_LinearCast; cs.mAllowSleeping = false;
       if (!live) { cs.mOverrideMassProperties = J.EOverrideMassProperties_CalculateInertia; cs.mMassPropertiesOverride.mMass = 2.6 * Math.PI * r * r * 2 * hh; }
       const body = bi.CreateBody(cs); bi.AddBody(body.GetID(), J.EActivation_Activate); J.destroy(cs);
       const b = { body, id: body.GetID(), r, hh, live }; b.key = b.id.GetIndexAndSequenceNumber(); W.names.set(b.key, live ? 'the other larva' : 'a stone');
