@@ -2122,9 +2122,10 @@ function drawGlassPhys(ctx, W, H, world, g, body, opts = {}) {
     sn.top.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
     ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fill('evenodd');
   }
-  path(sn.top); ctx.fillStyle = 'rgba(0,0,0,0.05)'; ctx.fill(); ctx.lineWidth = opts.thin ? 1 : 1.4;
-  if (opts.dashed) ctx.setLineDash([4, 3]);
-  ctx.stroke(); path(sn.out); ctx.stroke(); ctx.setLineDash([]);
+  path(sn.top); ctx.fillStyle = opts.thin ? 'rgba(0,0,0,0.025)' : 'rgba(0,0,0,0.05)'; ctx.fill(); ctx.lineWidth = opts.thin ? 1 : 1.4;
+  if (opts.thin) ctx.strokeStyle = '#888';      // a glass that is not on the larva: grey, solid
+  if (tilt > 0.5 * DEG) ctx.stroke();           // the top face shows apart from the outline only when it is tilted
+  path(sn.out); ctx.stroke();
   ctx.restore();
   if (opts.noSide) return;
   // the side box: cut the slab with the upright plane through the body's axis
@@ -2362,7 +2363,7 @@ function createGlassTry(skill, rng, params) {
       drawScene(ctx, W, H, body, null, []);
       for (const sh of shapes) {
         const on = sh === cur && state !== 'off';
-        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { dashed: !on, thin: !on, noSide: sh !== cur, label: 'glass on the back, cut along the body\'s axis' });
+        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { thin: !on, noSide: sh !== cur, label: 'glass on the back, cut along the body\'s axis' });
         const poly = glassSeen(ph.world, sh.g).out; let top = -Infinity, left = Infinity; for (const q of poly) { top = Math.max(top, q.y); left = Math.min(left, q.x); }
         ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
         ctx.fillText(sh.name + (sh.rejected ? ' — let go' : sh === cur && state === 'keep' ? ' — kept' : on ? ' — on its back' : ' — on the floor'), X(left), Y(top) - 6);
