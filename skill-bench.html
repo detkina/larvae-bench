@@ -264,7 +264,7 @@ const SKILLS = [
   { value: 'fore-l',  label: 'On the left side: front twisted, legs down', kind: 'fore', posture: 'left' },
   { value: 'fore-r',  label: 'On the right side: front twisted, legs down', kind: 'fore', posture: 'right' },
   { value: 'glass',   label: 'Reference glass: lying on the floor', kind: 'glass', posture: 'left', where: 'floor' },
-  { value: 'glass-over', label: 'Reference glass: held over a curled larva (cover test)', kind: 'glass', posture: 'left', where: 'over' }
+  { value: 'glass-over', label: 'Reference glass on the back: the larva turns it to cover itself', kind: 'glass', posture: 'left', where: 'over' }
 ];
 
 const SCHEMA = [
@@ -994,7 +994,8 @@ function createGlassBench(skill, rng, params) {
   const span = longest(REF_GLASS.local);
   // on the floor: beside the larva, across its middle, so the side view shows
   // both at the same height. Over: held up on the larva, as built.
-  const G = over ? { x: body.x - REF_GLASS.larvaAt.x, y: body.y - REF_GLASS.larvaAt.y, rot: 0 }
+  // over: it starts badly turned, so the larva has something to set right at once
+  const G = over ? { x: body.x - REF_GLASS.larvaAt.x + 0.2, y: body.y - REF_GLASS.larvaAt.y - 0.15, rot: 70 * DEG }
     : { x: ARENA.W / 2, y: ARENA.H / 2 + 2.5, rot: 0 };
   const worldAt = (x, y, rot) => {
     const c = Math.cos(rot), s2 = Math.sin(rot);
@@ -1011,13 +1012,78 @@ function createGlassBench(skill, rng, params) {
   // which turns of the glass, about its own centre where it is now, still cover the larva
   const turns = () => { const out = []; for (let k = 0; k < 72; k++) out.push(coverMargin(curledParts(body), worldAt(G.x, G.y, k * 5 * DEG))); return out; };
   const okShare = arr => arr.filter(m => m >= GLASS.MARGIN - 1e-3).length / arr.length;
-  const shareRef = okShare(turns());
+  const shareRef = (() => { const r0 = G.rot, x0 = G.x, y0 = G.y; G.x = body.x - REF_GLASS.larvaAt.x; G.y = body.y - REF_GLASS.larvaAt.y; G.rot = 0;
+    const v = okShare(turns()); G.x = x0; G.y = y0; G.rot = r0; return v; })();
+
+  /* The larva works the glass on its back with its legs, by feel. It feels,
+     part by part, where the glass is short of 2 mm over it (that skin gets the
+     light), wiggles the glass a little each way, turning it about the point
+     over its legs and sliding it, and keeps whatever leaves less of it short.
+     When no small wiggle helps, it keeps turning the glass the same way round,
+     sliding it as it goes, until it is clearly better covered than where it
+     got stuck; then it goes back to small wiggles. It stops as soon as every point is covered with 2 mm. */
+  const TURN = 15 * DEG, SLIDE = 0.1;          // per second: turning, sliding
+  const parts = () => curledParts(body);
+  const NAMES = ['tail', 'middle', 'head'];
+  const short = poly => {                       // how much it is short, and where most
+    let sum = 0, worst = 0, where = '';
+    parts().forEach((pt, i) => { for (let k = 0; k <= 12; k++) {
+      const t = k / 12, q = { x: pt.a.x + (pt.b.x - pt.a.x) * t, y: pt.a.y + (pt.b.y - pt.a.y) * t };
+      const d = polyEdgeDist(poly, q), m = polyContains(poly, q) ? d - pt.r : -d - pt.r;
+      const lack = Math.max(0, GLASS.MARGIN - m);
+      sum += lack; if (lack > worst) { worst = lack; where = NAMES[i]; }
+    } });
+    return { sum, where };
+  };
+  const pivot = () => { const p = body.points(); return { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }; };
+  // turning about the legs moves the glass's centre round that point
+  const turned = (x, y, rot, a) => { const P = pivot(), c = Math.cos(a), s2 = Math.sin(a);
+    return { x: P.x + (x - P.x) * c - (y - P.y) * s2, y: P.y + (x - P.x) * s2 + (y - P.y) * c, rot: rot + a }; };
+  let work = 'start', sweep = 1, held = false, sweepFrom = 0, swept = 0;
 
   return {
     body, target: null,
-    step() {},
+    step(dt) {
+      if (!over || drag) { held = !!drag; return; }
+      held = false;
+      const now = short(world());
+      if (now.sum <= 1e-9) { work = 'covered'; return; }
+      const a = TURN * dt, d = SLIDE * dt;
+      const tries = [
+        turned(G.x, G.y, G.rot, a), turned(G.x, G.y, G.rot, -a),
+        { x: G.x + d, y: G.y, rot: G.rot }, { x: G.x - d, y: G.y, rot: G.rot },
+        { x: G.x, y: G.y + d, rot: G.rot }, { x: G.x, y: G.y - d, rot: G.rot }
+      ];
+      if (work === 'sweep') {
+        // committed: turn on round, and slide it if that helps on the way
+        let c = turned(G.x, G.y, G.rot, sweep * a), v = short(worldAt(c.x, c.y, c.rot)).sum;
+        for (const [ex, ey] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
+          const c2 = { x: c.x + ex, y: c.y + ey, rot: c.rot }, v2 = short(worldAt(c2.x, c2.y, c2.rot)).sum;
+          if (v2 < v) { v = v2; c = c2; }
+        }
+        G.x = c.x; G.y = c.y; G.rot = wrap(c.rot); swept += a;
+        if (v < 0.6 * sweepFrom) work = 'turn';
+        else if (swept > 2 * Math.PI) { sweep = -sweep; swept = 0; }
+        return;
+      }
+      let best = null, bestS = now.sum;
+      for (const c of tries) { const v = short(worldAt(c.x, c.y, c.rot)).sum; if (v < bestS - 1e-9) { bestS = v; best = c; } }
+      if (best) {
+        if (best.rot !== G.rot) sweep = Math.sign(best.rot - G.rot);
+        work = best.rot !== G.rot ? 'turn' : 'slide';
+        G.x = best.x; G.y = best.y; G.rot = wrap(best.rot);
+      } else { work = 'sweep'; sweepFrom = now.sum; swept = 0; }
+    },
     status() {
       if (over) {
+        const sh = short(world());
+        if (held) return { action: 'GLASS HELD BY THE OBSERVER', reason: 'let go of it and the larva will set it right', detail: 'turned ' + Math.round(G.rot / DEG) + '°' };
+        if (work !== 'covered' && sh.sum > 1e-9) {
+          const reason = work === 'sweep' ? 'the ' + sh.where + ' is still in the light and small wiggles do not help — turning the glass on round'
+            : work === 'slide' ? 'the ' + sh.where + ' is short of glass — sliding the glass over it with the legs'
+            : 'the ' + sh.where + ' is short of glass — turning the glass with the legs';
+          return { action: 'SETTING THE GLASS', reason, detail: 'turned ' + Math.round(G.rot / DEG) + '° · covers properly at ' + Math.round(shareRef * 100) + '% of turns about its centre as built' };
+        }
         const m = coverMargin(curledParts(body), world());
         const detail = REF_GLASS.corners + ' curved edges · ' + REF_GLASS.area.toFixed(1) + ' cm² · ' + (span * 10).toFixed(0) +
           ' mm across · turned ' + Math.round(G.rot / DEG) + '° · covers properly at ' + Math.round(shareRef * 100) + '% of turns about its centre as built';
@@ -1030,8 +1096,13 @@ function createGlassBench(skill, rng, params) {
           ' mm across · would cover this larva curled up with ' + (REF_COVER * 10).toFixed(1) + ' mm to spare · turned ' + Math.round(G.rot / DEG) + '°' };
     },
     done() { return null; },
-    snapshot() { return { G: { x: G.x, y: G.y, rot: G.rot }, skipChecks: true }; },
-    invariants: [],
+    snapshot() { return { G: { x: G.x, y: G.y, rot: G.rot }, held, skipChecks: held || !over }; },
+    invariants: [
+      { name: 'glass jump', check: (a, b) => { const d = Math.hypot(b.G.x - a.G.x, b.G.y - a.G.y);
+        return d > 0.05 ? 'glass moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } },
+      { name: 'glass spin', check: (a, b) => { const w = Math.abs(wrap(b.G.rot - a.G.rot)) / Harness.DT / DEG;
+        return w > 30 ? 'glass turned at ' + w.toFixed(0) + '°/s' : null; } }
+    ],
     pointer(kind, px, py, extra) {
       const w = { x: px / PX, y: ARENA.H - py / PX };
       if (kind === 'down') { if (polyContains(world(), w)) drag = { dx: G.x - w.x, dy: G.y - w.y }; return true; }
@@ -1057,7 +1128,8 @@ function createGlassBench(skill, rng, params) {
       const mNow = over ? coverMargin(curledParts(body), poly) : 1;
       ctx.strokeStyle = mNow >= GLASS.MARGIN - 1e-3 ? '#000' : '#c00'; ctx.lineWidth = 1.4; ctx.stroke();
       ctx.fillStyle = '#000'; ctx.font = '11px Helvetica, Arial, sans-serif';
-      ctx.fillText('drag the glass · wheel over it turns it', 14, 18);
+      ctx.fillText(over ? 'drag or turn the glass (wheel) and let go: the larva sets it right · no need to press Пуск'
+        : 'drag the glass · wheel over it turns it', 14, 18);
       if (over) {
         // a strip of all turns about the glass's centre: black = covers with 2 mm, grey = does not
         const tv = turns(), sx = 14, sy = 30, cw = 4;
