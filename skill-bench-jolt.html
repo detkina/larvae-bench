@@ -538,10 +538,10 @@
     system.SetGravity(v3(0, -G, 0));
     // small things: contact tolerances in cm
     const ps = system.GetPhysicsSettings();
-    ps.mSpeculativeContactDistance = 0.1;
+    ps.mSpeculativeContactDistance = 0.3;
     ps.mPenetrationSlop = 0.003;
     ps.mLinearCastThreshold = 0.5;
-    ps.mManifoldTolerance = 0.001;
+    ps.mManifoldTolerance = 0.05;
     ps.mNumVelocitySteps = 30;
     ps.mNumPositionSteps = 10;
     ps.mBaumgarte = 0.8;
@@ -552,7 +552,7 @@
     W.nameOf = k => W.names.get(k) || ('body ' + (k & 0x7fffff));
     // reused per step, so stepping allocates nothing in the solver's memory
     const TMP = { r: new J.RVec3(), v: new J.Vec3(), q: J.Quat.prototype.sIdentity(), r2: new J.Vec3() };
-    W.tune = Object.assign({ springHz: 90, substeps: 8, segContact: 0.05, flatS: 0.6 }, opts.tune || {});
+    W.tune = Object.assign({ springHz: 90, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
     W.skinTouch = new Map();     // other body key → contacts with the larva's soft body this step
     // rigid contacts this step (the head, glasses, stones, floor): pairs of keys, depth, normal
     W.contacts = [];
@@ -586,8 +586,9 @@
 
     // the floor
     {
-      const shape = new J.BoxShapeSettings(v3(60, 1, 60), 0).Create().Get();
-      const cs = new J.BodyCreationSettings(shape, r3(0, -1, 0), J.Quat.prototype.sIdentity(), J.EMotionType_Static, LAYER_STATIC);
+      // no bigger than the bench: a huge box against small pieces loses precision
+      const shape = new J.BoxShapeSettings(v3(20, 0.5, 15), 0).Create().Get();
+      const cs = new J.BodyCreationSettings(shape, r3(16, -0.5, 10), J.Quat.prototype.sIdentity(), J.EMotionType_Static, LAYER_STATIC);
       cs.mFriction = 0.8; cs.mRestitution = 0;
       W.floor = bi.CreateBody(cs); bi.AddBody(W.floor.GetID(), J.EActivation_DontActivate);
       W.floorId = W.floor.GetID().GetIndexAndSequenceNumber(); W.names.set(W.floorId, 'the floor');
@@ -732,7 +733,7 @@
           const y = -sg.len / 2 + sg.len * i / n;
           for (let k = 0; k < 10; k++) {
             const t = k / 10 * 2 * Math.PI, w = qrot(qx, qy, qz, qw, Math.cos(t) * sg.r, y, Math.sin(t) * sg.r);
-            out.push({ x: w[0] + p.GetX(), y: w[2] + p.GetZ(), z: w[1] + p.GetY(), s: sg.s0 + (sg.s1 - sg.s0) * i / n });
+            out.push({ x: w[0] + p.GetX(), y: w[2] + p.GetZ(), z: w[1] + p.GetY(), s: sg.s0 + (sg.s1 - sg.s0) * i / n, seg: sg.key });
           }
         }
       }
@@ -2142,14 +2143,22 @@ function drawGlassPhys(ctx, W, H, world, g, body, opts = {}) {
   }
   ctx.save();
   ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, 108); ctx.clip();
-  ctx.strokeStyle = opts.color || '#000'; ctx.lineWidth = 1.2; if (opts.dashed) ctx.setLineDash([4, 3]);
+  // the whole slab seen from the side (grey): its faces, the upright ones too
+  const sil = convexHull(P3.map(q => ({ x: (q.x - body.x) * u.x + (q.y - body.y) * u.y, y: q.z })));
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 1; ctx.setLineDash(opts.dashed ? [4, 3] : []);
+  ctx.beginPath(); sil.forEach((q, i) => i ? ctx.lineTo(ox + q.x * K, fy - q.y * K) : ctx.moveTo(ox + q.x * K, fy - q.y * K)); ctx.closePath(); ctx.stroke();
+  for (let i = 0; i < n; i++) {         // its upright edges, where they show
+    const a = P3[i], b = P3[n + i], ax = (a.x - body.x) * u.x + (a.y - body.y) * u.y, bx = (b.x - body.x) * u.x + (b.y - body.y) * u.y;
+    if (i % Math.max(1, Math.round(n / 3)) === 0) { ctx.beginPath(); ctx.moveTo(ox + ax * K, fy - a.z * K); ctx.lineTo(ox + bx * K, fy - b.z * K); ctx.stroke(); }
+  }
+  ctx.strokeStyle = opts.color || '#000'; ctx.lineWidth = 1.2; ctx.setLineDash(opts.dashed ? [4, 3] : []);
   if (cut.length >= 3) {
     const hull = convexHull(cut);
     ctx.beginPath(); hull.forEach((q, i) => i ? ctx.lineTo(ox + q.x * K, fy - q.y * K) : ctx.moveTo(ox + q.x * K, fy - q.y * K)); ctx.closePath(); ctx.stroke();
   }
   ctx.setLineDash([]);
   ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
-  if (opts.label) ctx.fillText(cut.length >= 3 ? opts.label : 'the glass is not over the body\'s axis', x0 + 6, y0 + 24);
+  if (opts.label) { ctx.fillText(cut.length >= 3 ? 'glass: cut along the axis (black)' : 'the glass is not over the axis', x0 + 6, y0 + 24); ctx.fillText('the whole slab (grey)', x0 + 6, y0 + 35); }
   ctx.restore();
 }
 
@@ -2195,7 +2204,7 @@ const TRY = {
   OFF_SPEED: 1.0,               // cm/s the legs slide a rejected glass off
   SETTLE_S: 1.0,                // seconds a glass is left to settle on the body
   LEG_FORCE: 20000,             // g·cm/s²: the most the legs push a glass with (about 20 g-force)
-  OFF_FORCE: 6000               // g·cm/s²: how hard they shove a glass they let go off the body
+  CURL_S: 1.5                   // s to curl up again after crawling out from a glass
 };
 function makeSetterPhys(body, ph, g) {
   const pivot = () => { const p = body.points(); return { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }; };
@@ -2278,7 +2287,10 @@ function createGlassTry(skill, rng, params) {
     else sh.g = ph.world.addGlass(sh.local, GLASS.THICK, sh.floor.x, sh.floor.y, sh.floor.rot, 0.001);
     sh.tried = false; sh.rejected = false;
   }
-  let cur = shapes[firstIdx], state = 'settle', t = 0, k = 0, setter = null;
+  let cur = shapes[firstIdx], state = 'settle', t = 0, k = 0, setter = null, from = null;
+  // where a glass is laid on this curl now (the larva may have crawled and turned): badly turned, as at the start
+  const homeNow = () => { const c = Math.cos(body.psi), sn = Math.sin(body.psi), lx = -REF_GLASS.larvaAt.x + 0.2, ly = -REF_GLASS.larvaAt.y - 0.15;
+    return { x: body.x + lx * c - ly * sn, y: body.y + lx * sn + ly * c, rot: body.psi + 70 * DEG }; };
   return {
     body, target: null,
     step(dt) {
@@ -2291,16 +2303,22 @@ function createGlassTry(skill, rng, params) {
         else if (r === 'give-up') { cur.rejected = true; state = 'off'; k = 0; setter.release(); }
         if (r === 'covered') setter.release();
       } else if (state === 'off') {
-        // the legs let go of it and shove it off sideways, away from the body, with a
-        // limited force, until it is off the body; it tips down onto the floor by itself
+        // it just stops holding the glass with its legs and crawls on; the glass,
+        // no longer held, slides off the body and falls by itself
         k += dt;
-        if (!cur.letGo) { ph.world.release(cur.g); cur.letGo = true; }
-        const c0 = cur.g.body.GetCenterOfMassPosition(), P = body.points().TM, dx = c0.GetX() - P.x, dy = c0.GetZ() - P.y, n = Math.hypot(dx, dy) || 1;
+        if (!cur.letGo) { ph.world.release(cur.g); cur.letGo = true; body.headLift = GAIT.HEAD_LIFT * DEG; }
+        body.step(dt, { go: true, aim: 0 });
         const out = glassSeen(ph.world, cur.g).out;
         const onBody = larvaPoints(ph).some(q => polyContains(out, q) || polyEdgeDist(out, q) < 0.3);
-        const resting = ph.world.glassSpeed(cur.g).v < 0.05;
-        if (onBody && k < 8) ph.world.pushGlass(cur.g, dx / n * TRY.OFF_FORCE, dy / n * TRY.OFF_FORCE, 0, { x: c0.GetX(), y: c0.GetZ(), z: c0.GetY() });
-        else if (resting || k > 12) {
+        if ((!onBody && ph.world.glassSpeed(cur.g).v < 0.05 && !body.inStroke) || k > 60) { state = 'recurl'; k = 0; from = { beta: body.beta, delta: body.delta }; }
+      } else if (state === 'recurl') {
+        // it curls up again where it is
+        k = Math.min(1, k + dt / TRY.CURL_S);
+        body.lam = 0;
+        body.beta = from.beta + (POSTURES.left.legs * GLASS.CURL * DEG - from.beta) * smooth(k);
+        body.delta = body.clampHead(from.delta + (POSTURES.left.legs * GLASS.HEAD_CURL * DEG - from.delta) * smooth(k));
+        body.headLift = GAIT.HEAD_LIFT * DEG + (HEAD_LIFT_UNDER - GAIT.HEAD_LIFT * DEG) * smooth(k);
+        if (k >= 1) {
           const other = shapes.find(s2 => s2 !== cur);
           if (other.tried && other.rejected) state = 'none';
           else { cur = other; state = 'take'; k = 0; }
@@ -2309,10 +2327,9 @@ function createGlassTry(skill, rng, params) {
         // a plain move: the other glass is put on the back, from just above
         k += dt;
         if (k >= TRY.MOVE_S) {
-          // plain moves (not modelled yet): the let-go glass is put where the other one lay, the other on the back
-          const old = shapes.find(s2 => s2 !== cur);
-          ph.world.placeGlass(old.g, cur.floor.x, cur.floor.y, cur.floor.rot, 0.001);
-          ph.world.placeGlass(cur.g, home.x + 0.2, home.y - 0.15, 70 * DEG, ONTOP); ph.world.setWeight(cur.g, 0); state = 'settle'; k = 0;
+          // a plain move (not modelled yet): the other glass is put on its back, where it lies now
+          const h = homeNow();
+          ph.world.placeGlass(cur.g, h.x, h.y, h.rot, ONTOP); ph.world.setWeight(cur.g, 0); state = 'settle'; k = 0;
         }
       }
     },
@@ -2321,7 +2338,8 @@ function createGlassTry(skill, rng, params) {
       const detail = 'trying the ' + cur.name + ' glass · tilted ' + Math.round(ph.world.glassTilt(cur.g) / DEG) + '°';
       if (state === 'settle') return { action: 'THE GLASS SETTLES ON ME', reason: 'the ' + cur.name + ' glass is laid on my back; it comes to rest on my body', detail };
       if (state === 'set') return { action: 'TRYING THE ' + cur.name.toUpperCase() + ' GLASS ON', reason: (sh && sh.where ? 'the ' + sh.where + ' is short of glass — ' : '') + 'working it round with the legs', detail };
-      if (state === 'off') return { action: 'LETTING IT GO', reason: 'the ' + cur.name + ' glass never covered me — the legs slide it off', detail };
+      if (state === 'off') return { action: 'LETTING IT GO', reason: 'the ' + cur.name + ' glass never covered me — the legs let go of it and I crawl on; it falls off by itself', detail };
+      if (state === 'recurl') return { action: 'CURLING UP AGAIN', reason: 'out from under the glass I let go', detail };
       if (state === 'take') return { action: 'TAKING THE OTHER GLASS', reason: 'shown as a plain move: getting under a glass is a skill of its own', detail };
       if (state === 'keep') return { action: 'KEEPING IT', reason: 'the ' + cur.name + ' glass covers me all round with 2 mm', detail };
       return { action: 'NO GLASS FITS', reason: 'neither glass covered me', detail };
@@ -2332,7 +2350,7 @@ function createGlassTry(skill, rng, params) {
       if (t > 600) return { ok: false, why: 'still trying after 600 s' };
       return null;
     },
-    snapshot() { return { G: glassSnap(ph.world, cur.g), state, skipChecks: state === 'take' }; },
+    snapshot() { return { G: glassSnap(ph.world, cur.g), state, skipChecks: state === 'take' || state === 'settle' && k < 0.05 }; },
     // the body lies still here; only the legs work the glass, so nothing to hold back
     keepWorking() { return true; },
     invariants: [
@@ -2344,7 +2362,7 @@ function createGlassTry(skill, rng, params) {
       drawScene(ctx, W, H, body, null, []);
       for (const sh of shapes) {
         const on = sh === cur && state !== 'off';
-        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { dashed: !on, thin: !on, noSide: !on, label: 'glass on the back, cut along the body\'s axis' });
+        drawGlassPhys(ctx, W, H, ph.world, sh.g, body, { dashed: !on, thin: !on, noSide: sh !== cur, label: 'glass on the back, cut along the body\'s axis' });
         const poly = glassSeen(ph.world, sh.g).out; let top = -Infinity, left = Infinity; for (const q of poly) { top = Math.max(top, q.y); left = Math.min(left, q.x); }
         ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
         ctx.fillText(sh.name + (sh.rejected ? ' — let go' : sh === cur && state === 'keep' ? ' — kept' : on ? ' — on its back' : ' — on the floor'), X(left), Y(top) - 6);
@@ -2612,18 +2630,13 @@ function drawSideView(ctx, W, H, body) {
   if (body.phys) {
     // the skin as the solver has it, seen from the side across the middle's axis:
     // its upper and lower outline (a pressed tail shows lower here)
-    const u = body.u(), pts = body.phys.world.skinPoints(body.phys.larva), bins = new Map(), BIN = 0.04;
-    for (const q of pts) {
-      const a2 = (q.x - body.x) * u.x + (q.y - body.y) * u.y, k = Math.round(a2 / BIN);
-      const e = bins.get(k), lo = q.z - Physics.VR, hi = q.z + Physics.VR;   // each skin point is a small ball
-      if (!e) bins.set(k, { lo, hi }); else { e.lo = Math.min(e.lo, lo); e.hi = Math.max(e.hi, hi); }
-    }
-    const ks = [...bins.keys()].sort((a2, b2) => a2 - b2);
-    if (ks.length) {
-      ctx.beginPath();
-      ks.forEach((k, i) => { const e = bins.get(k); i ? ctx.lineTo(sx(k * BIN), sy(e.hi)) : ctx.moveTo(sx(k * BIN), sy(e.hi)); });
-      for (let i = ks.length - 1; i >= 0; i--) { const e = bins.get(ks[i]); ctx.lineTo(sx(ks[i] * BIN), sy(e.lo)); }
-      ctx.closePath(); ctx.stroke();
+    const u = body.u(), pts = body.phys.world.skinPoints(body.phys.larva);
+    // each soft segment, as it is now, seen from the side: the outline of its surface
+    const bySeg = new Map();
+    for (const q of pts) { const k = q.seg; if (!bySeg.has(k)) bySeg.set(k, []); bySeg.get(k).push({ x: (q.x - body.x) * u.x + (q.y - body.y) * u.y, y: q.z }); }
+    for (const list of bySeg.values()) {
+      const hull = convexHull(list);
+      ctx.beginPath(); hull.forEach((q, i) => i ? ctx.lineTo(sx(q.x), sy(q.y)) : ctx.moveTo(sx(q.x), sy(q.y))); ctx.closePath(); ctx.stroke();
     }
     const hp = body.phys.world.headPoint(body.phys.larva), ha = (hp.x - body.x) * u.x + (hp.y - body.y) * u.y;
     ctx.beginPath(); ctx.arc(sx(ha), sy(hp.z), hr * K, 0, 2 * Math.PI); ctx.stroke();

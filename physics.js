@@ -63,10 +63,10 @@
     system.SetGravity(v3(0, -G, 0));
     // small things: contact tolerances in cm
     const ps = system.GetPhysicsSettings();
-    ps.mSpeculativeContactDistance = 0.1;
+    ps.mSpeculativeContactDistance = 0.3;
     ps.mPenetrationSlop = 0.003;
     ps.mLinearCastThreshold = 0.5;
-    ps.mManifoldTolerance = 0.001;
+    ps.mManifoldTolerance = 0.05;
     ps.mNumVelocitySteps = 30;
     ps.mNumPositionSteps = 10;
     ps.mBaumgarte = 0.8;
@@ -77,7 +77,7 @@
     W.nameOf = k => W.names.get(k) || ('body ' + (k & 0x7fffff));
     // reused per step, so stepping allocates nothing in the solver's memory
     const TMP = { r: new J.RVec3(), v: new J.Vec3(), q: J.Quat.prototype.sIdentity(), r2: new J.Vec3() };
-    W.tune = Object.assign({ springHz: 90, substeps: 8, segContact: 0.05, flatS: 0.6 }, opts.tune || {});
+    W.tune = Object.assign({ springHz: 90, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
     W.skinTouch = new Map();     // other body key → contacts with the larva's soft body this step
     // rigid contacts this step (the head, glasses, stones, floor): pairs of keys, depth, normal
     W.contacts = [];
@@ -111,8 +111,9 @@
 
     // the floor
     {
-      const shape = new J.BoxShapeSettings(v3(60, 1, 60), 0).Create().Get();
-      const cs = new J.BodyCreationSettings(shape, r3(0, -1, 0), J.Quat.prototype.sIdentity(), J.EMotionType_Static, LAYER_STATIC);
+      // no bigger than the bench: a huge box against small pieces loses precision
+      const shape = new J.BoxShapeSettings(v3(20, 0.5, 15), 0).Create().Get();
+      const cs = new J.BodyCreationSettings(shape, r3(16, -0.5, 10), J.Quat.prototype.sIdentity(), J.EMotionType_Static, LAYER_STATIC);
       cs.mFriction = 0.8; cs.mRestitution = 0;
       W.floor = bi.CreateBody(cs); bi.AddBody(W.floor.GetID(), J.EActivation_DontActivate);
       W.floorId = W.floor.GetID().GetIndexAndSequenceNumber(); W.names.set(W.floorId, 'the floor');
@@ -257,7 +258,7 @@
           const y = -sg.len / 2 + sg.len * i / n;
           for (let k = 0; k < 10; k++) {
             const t = k / 10 * 2 * Math.PI, w = qrot(qx, qy, qz, qw, Math.cos(t) * sg.r, y, Math.sin(t) * sg.r);
-            out.push({ x: w[0] + p.GetX(), y: w[2] + p.GetZ(), z: w[1] + p.GetY(), s: sg.s0 + (sg.s1 - sg.s0) * i / n });
+            out.push({ x: w[0] + p.GetX(), y: w[2] + p.GetZ(), z: w[1] + p.GetY(), s: sg.s0 + (sg.s1 - sg.s0) * i / n, seg: sg.key });
           }
         }
       }
