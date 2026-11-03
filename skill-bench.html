@@ -257,8 +257,8 @@ const SKILLS = [
   { value: 'crawl-back',  label: 'Crawl to target on the back',       posture: 'back' },
   { value: 'roll-lr', label: 'Roll from the left side to the right, over the back', kind: 'roll', from: 'left', to: 'right' },
   { value: 'roll-rl', label: 'Roll from the right side to the left, over the back', kind: 'roll', from: 'right', to: 'left' },
-  { value: 'ring-l',  label: 'Curl on the left side, crawl round, push aside (next)', disabled: true },
-  { value: 'ring-r',  label: 'Curl on the right side, crawl round, push aside (next)', disabled: true },
+  { value: 'ring-l',  label: 'On the left side: crawl round a ring, push things out', kind: 'ring', posture: 'left' },
+  { value: 'ring-r',  label: 'On the right side: crawl round a ring, push things out', kind: 'ring', posture: 'right' },
   { value: 'tail-l',  label: 'On the left side: tail toward the legs, the back, up', kind: 'poses', posture: 'left' },
   { value: 'tail-r',  label: 'On the right side: tail toward the legs, the back, up', kind: 'poses', posture: 'right' },
   { value: 'fore-l',  label: 'On the left side: front twisted, legs down', kind: 'fore', posture: 'left' },
@@ -280,7 +280,11 @@ const SCHEMA = [
   { key: 'foreCurl', label: 'Front twist: tail bend before', type: 'number', min: 0, max: 120, step: 5, value: 110, unit: '°',
     hint: 'Tail bent toward the legs as the larva lies on its side before the twist.' },
   { key: 'foreEase', label: 'Front twist: tail unbends by', type: 'number', min: 0, max: 60, step: 5, value: 30, unit: '°',
-    hint: 'While the front turns legs down, the tail straightens a little by this much.' }
+    hint: 'While the front turns legs down, the tail straightens a little by this much.' },
+  { key: 'ringR', label: 'Ring: radius', type: 'number', min: 2, max: 7, step: 0.5, value: 4, unit: 'cm',
+    hint: 'How wide a circle the larva crawls, bending toward its legs all the way round.' },
+  { key: 'ringTail', label: 'Ring: tail bend', type: 'number', min: 0, max: 120, step: 5, value: 60, unit: '°',
+    hint: 'Tail bent toward the legs while it crawls round.' }
 ];
 
 const SkillBench = {
@@ -289,6 +293,7 @@ const SkillBench = {
     if (skill.kind === 'roll') return createRoll(skill, rng, params.curl);
     if (skill.kind === 'poses') return createPoses(skill, rng, params);
     if (skill.kind === 'fore') return createFore(skill, rng, params);
+    if (skill.kind === 'ring') return createRing(skill, rng, params);
     const rL = rng('larva'), rT = rng('target');
     const body = makeBody(skill.posture, rL);
     body.x = rL.range(ARENA.W * 0.4, ARENA.W * 0.6);
@@ -640,6 +645,249 @@ function createFore(skill, rng, params) {
     pointer() { return false; },
     draw(ctx, W, H) { drawScene(ctx, W, H, body, null, []); }
   };
+}
+
+
+/* ---------------- RING: crawl round on a side, pushing things out ----------------
+   Lying on a side, the larva crawls round a circle, bending toward its legs
+   all the way (driven by the legs: no tail strokes). What it meets it pushes
+   out of the ring:
+   - a stone at the head: with the head and the legs;
+   - a stone at the tail: with the tail;
+   - something alive or shaking (another larva, glass another larva holds):
+     only with the head, the jaws and the legs. The head is hard, the tail is
+     soft: if it comes at the tail, the larva turns round to meet it head on,
+     pushes it out, and turns back to its ring. */
+const RING = {
+  SPEED: 0.12,       // cm/s along the ring (measured average crawl, 1.2 mm/s)
+  PUSH: 0.15,        // cm/s an obstacle is pushed
+  TURN: 30,          // deg/s turning on the spot
+  CLEAR: 1.4,        // cm off the ring line: an obstacle this far is out of the way
+  STONE_R: 0.4, LIVE_R: 0.5,
+  CREEP: 0.25,       // cm/s the other larva creeps along the ring toward this one
+  SHAKE: 0.02,       // cm it shakes each tick
+  MAX_T: 900
+};
+
+function createRing(skill, rng, params) {
+  const rL = rng('larva'), rO = rng('other');
+  const body = makeBody(skill.posture, rL);
+  const legs = POSTURES[skill.posture].legs;
+  const R = params.ringR, dir = -legs;          // left side: clockwise, legs toward the centre
+  const C = { x: ARENA.W / 2, y: ARENA.H / 2 };
+  const tailBend = legs * params.ringTail * DEG;
+  let th = rL.range(-Math.PI, Math.PI), th0 = th, done = 0;   // where the middle is on the ring
+  let psi = 0, M = { x: 0, y: 0 };
+  let state = 'crawl', why = 'crawling round, bending toward the legs', cur = null, turned = 0, sway = 0;
+  const tangent = a => Math.atan2(-legs * -Math.cos(a), -legs * Math.sin(a)) ;   // heading along the ring
+  function onRing() {
+    M = { x: C.x + R * Math.cos(th), y: C.y + R * Math.sin(th) };
+    psi = Math.atan2(dir * Math.cos(th), -dir * Math.sin(th));
+  }
+  function place() {
+    body.psi = psi;
+    body.x = M.x - Math.cos(psi) * BODY.MID_LEN / 2;
+    body.y = M.y - Math.sin(psi) * BODY.MID_LEN / 2;
+  }
+  onRing(); place();
+  body.beta = tailBend; body.lam = 0; body.delta = 0;
+
+  // the body as three round parts, for touching
+  function parts() {
+    const p = body.points();
+    return [
+      { name: 'head', a: p.head, b: p.head, r: BODY.HEAD_D / 2 },
+      { name: 'front', a: { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }, b: p.MH, r: BODY.MID_D / 2 },
+      { name: 'back', a: p.TM, b: { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }, r: BODY.MID_D / 2 },
+      { name: 'tail', a: p.TM, b: p.tailEnd, r: BODY.TAIL_D / 2 }
+    ];
+  }
+  function segDist(q, a, b) {
+    const vx = b.x - a.x, vy = b.y - a.y, L2 = vx * vx + vy * vy;
+    const t = L2 ? clamp(((q.x - a.x) * vx + (q.y - a.y) * vy) / L2, 0, 1) : 0;
+    const cx = a.x + t * vx, cy = a.y + t * vy;
+    return { d: Math.hypot(q.x - cx, q.y - cy), p: { x: cx, y: cy } };
+  }
+  function touch(o) {        // nearest part and the gap between it and the obstacle
+    let best = null;
+    for (const pt of parts()) {
+      const s = segDist(o, pt.a, pt.b), gap = s.d - pt.r - o.r;
+      if (!best || gap < best.gap) best = { part: pt.name, gap, at: s.p };
+    }
+    return best;
+  }
+
+  // the obstacles: two stones on the ring line, one in the tail's way, and a live one behind
+  const ahead = a => th + dir * a * DEG;
+  const pt = (a, r) => ({ x: C.x + r * Math.cos(a), y: C.y + r * Math.sin(a) });
+  const tailR = Math.hypot(body.points().tailEnd.x - C.x, body.points().tailEnd.y - C.y);
+  const obs = [
+    Object.assign(pt(ahead(80), R), { r: RING.STONE_R, live: false, name: 'stone 1', out: false }),
+    Object.assign(pt(ahead(170), tailR), { r: RING.STONE_R, live: false, name: 'stone 2', out: false }),
+    Object.assign(pt(ahead(260), R), { r: RING.STONE_R, live: false, name: 'stone 3', out: false }),
+    Object.assign(pt(ahead(-120), R), { r: RING.LIVE_R, live: true, name: 'another larva', out: false, ang: th + dir * -120 * DEG })
+  ];
+  // nothing may start inside or against the body
+  for (const o of obs) {
+    let k = 0;
+    while (touch(o).gap < 0.5 && k++ < 200) {
+      if (o.live) { o.ang -= dir * 0.02; o.x = C.x + R * Math.cos(o.ang); o.y = C.y + R * Math.sin(o.ang); }
+      else { const a = Math.atan2(o.y - C.y, o.x - C.x) + dir * 0.02, rr = Math.hypot(o.x - C.x, o.y - C.y); o.x = C.x + rr * Math.cos(a); o.y = C.y + rr * Math.sin(a); }
+    }
+  }
+
+  let t = 0;
+  // the head never jumps: it moves toward where it is wanted at its own rate
+  const head = (want, dt) => { const rt = GAIT.HEAD_RATE * DEG * dt * 3; body.delta = body.clampHead(body.delta + clamp(want - body.delta, -rt, rt)); };
+  // Nothing passes through the body: whatever the body moves into is shoved
+  // out of the way by the contact itself. The deliberate pushing is below.
+  function resolve() {
+    for (const o of obs) for (let k = 0; k < 6; k++) {
+      const g = touch(o);
+      if (g.gap >= 0) break;
+      let ux = o.x - g.at.x, uy = o.y - g.at.y; const L = Math.hypot(ux, uy) || 1;
+      o.x += ux / L * (-g.gap + 1e-4); o.y += uy / L * (-g.gap + 1e-4);
+      if (o.live) o.ang = Math.atan2(o.y - C.y, o.x - C.x);
+    }
+  }
+  function clearOf(o) { return Math.abs(Math.hypot(o.x - C.x, o.y - C.y) - R) >= RING.CLEAR; }
+
+  const sim = {
+    body, target: null,
+    step(dt) {
+      t += dt;
+      // the live one shakes, and creeps along the ring until it is pushed away
+      for (const o of obs) if (o.live) {
+        if (!o.out && cur !== o && state !== 'turn-to') {
+          o.ang += dir * RING.CREEP * dt / R;
+          const g = touch({ x: C.x + R * Math.cos(o.ang), y: C.y + R * Math.sin(o.ang), r: o.r });
+          if (g.gap > 0.005) { o.x = C.x + R * Math.cos(o.ang); o.y = C.y + R * Math.sin(o.ang); }
+          else o.ang -= dir * RING.CREEP * dt / R;
+        }
+        o.jx = rO.range(-RING.SHAKE, RING.SHAKE); o.jy = rO.range(-RING.SHAKE, RING.SHAKE);
+      }
+      sway += 2 * Math.PI * dt / GAIT.STROKE_S;
+
+      if (state === 'crawl') {
+        th += dir * RING.SPEED * dt / R; done += RING.SPEED * dt / R;
+        onRing(); place();
+        head(GAIT.SCAN * DEG * Math.sin(sway), dt);
+        body.beta = tailBend; body.lam = 0;
+        for (const o of obs) {
+          const g = touch(o);
+          if (g.gap > 0.01) continue;
+          const atTail = g.part === 'tail' || g.part === 'back';
+          cur = o; o.out = false;
+          if (o.live && atTail) { state = 'turn-to'; turned = 0; why = 'something alive at my soft tail — turning round to meet it head on'; }
+          else if (o.live) { state = 'push-head'; why = 'something alive at my head — pushing it out with head, jaws and legs'; }
+          else if (atTail) { state = 'push-tail'; why = 'a stone at my tail — pushing it out with the tail'; }
+          else { state = 'push-head'; why = 'a stone at my head — pushing it out with head and legs'; }
+          break;
+        }
+      } else if (state === 'turn-to') {
+        // turn on the spot, toward the legs, until the head faces it
+        const want = Math.atan2(cur.y - M.y, cur.x - M.x);
+        const d = wrap(want - psi);
+        const step = Math.min(Math.abs(d), RING.TURN * DEG * dt);
+        psi = wrap(psi - legs * step); turned += step; place();
+        head(GAIT.SCAN * DEG * Math.sin(sway), dt);
+        if (Math.abs(wrap(want - psi)) < 10 * DEG || turned > Math.PI * 1.2) {
+          state = 'face'; why = 'facing it — waiting for it to come to my head';
+        }
+      } else if (state === 'face') {
+        // it keeps coming; the larva holds still, head toward it
+        const away = Math.atan2(cur.y - M.y, cur.x - M.x);
+        const nx = cur.x - Math.cos(away) * RING.CREEP * dt, ny = cur.y - Math.sin(away) * RING.CREEP * dt;
+        const g = touch({ x: nx, y: ny, r: cur.r });
+        if (g.gap > 0.005) { cur.x = nx; cur.y = ny; }
+        else { state = 'push-head'; why = 'it is at my head — pushing it out with head, jaws and legs'; }
+        head(GAIT.SCAN * DEG * Math.sin(sway), dt);
+      } else if (state === 'push-head' || state === 'push-tail') {
+        const g = touch(cur);
+        let ux, uy;
+        if (state === 'push-head' && !cur.live) { ux = cur.x - C.x; uy = cur.y - C.y; }   // a stone ahead: out of the ring
+        else { ux = cur.x - g.at.x; uy = cur.y - g.at.y; }                                   // straight away from the body
+        const L = Math.hypot(ux, uy) || 1;
+        cur.x += ux / L * RING.PUSH * dt; cur.y += uy / L * RING.PUSH * dt;
+        if (state === 'push-head') {
+          // head and legs working against it: quick small sways
+          head(GAIT.SCAN * DEG * Math.sin(sway * 3), dt);
+        } else {
+          body.lam = 10 * DEG * Math.abs(Math.sin(sway * 2));
+          body.beta = tailBend - legs * 15 * DEG * Math.abs(Math.sin(sway * 2));
+        }
+        const gap = touch(cur).gap;
+        const free = cur.live ? gap >= 1.5 : (state === 'push-tail' ? gap >= 1.0 : clearOf(cur));
+        if (free) {
+          cur.out = true; body.lam = 0; body.beta = tailBend;
+          if (cur.live) { state = 'turn-back'; turned = 0; why = 'pushed it away — turning back to my ring'; }
+          else { state = 'crawl'; why = 'crawling round, bending toward the legs'; cur = null; }
+        }
+      } else if (state === 'turn-back') {
+        const want = Math.atan2(dir * Math.cos(th), -dir * Math.sin(th));
+        const d = wrap(want - psi);
+        const step = Math.min(Math.abs(d), RING.TURN * DEG * dt);
+        psi = wrap(psi + legs * step); place();
+        if (Math.abs(wrap(want - psi)) < 0.5 * DEG) { psi = want; place(); state = 'crawl'; cur = null; why = 'back on my ring, crawling round'; }
+      }
+      resolve();
+    },
+    status() {
+      const left = obs.filter(o => !o.out).length;
+      const detail = 'on its ' + body.label + ' · ' + Math.round(done / DEG) + '° of 360° round the ring · ' + left + ' thing' + (left === 1 ? '' : 's') + ' still in the ring';
+      const action = { crawl: 'CRAWLING ROUND', 'turn-to': 'TURNING ROUND', face: 'FACING IT', 'push-head': 'PUSHING WITH THE HEAD', 'push-tail': 'PUSHING WITH THE TAIL', 'turn-back': 'TURNING BACK' }[state];
+      return { action, reason: why, detail };
+    },
+    done() {
+      if (done >= 2 * Math.PI && obs.every(o => o.out)) return { ok: true, why: 'went round the ring and pushed everything out' };
+      if (t > RING.MAX_T) return { ok: false, why: 'did not clear the ring in ' + RING.MAX_T + ' s' };
+      return null;
+    },
+    snapshot() {
+      const p = body.points();
+      let pen = 0, who = '';
+      for (const o of obs) { const g = touch({ x: o.x + (o.jx || 0), y: o.y + (o.jy || 0), r: o.r }); if (-g.gap > pen) { pen = -g.gap; who = o.name + ' at the ' + g.part; } }
+      return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: +body.delta.toFixed(5),
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, tailEnd: { x: +p.tailEnd.x.toFixed(4), y: +p.tailEnd.y.toFixed(4) },
+        M: { x: M.x, y: M.y }, state, pen, who, pushing: false, skipChecks: false,
+        obstacles: obs.map(o => ({ name: o.name, x: +o.x.toFixed(3), y: +o.y.toFixed(3), out: o.out })) };
+    },
+    invariants: [
+      { name: 'overlap', check: (a, b) => b.pen > 0.06 ? b.who + ' is ' + (b.pen * 10).toFixed(1) + ' mm inside the body' : null },
+      { name: 'joints', check: (a, b) => {
+        if (Math.abs(b.beta) > JOINT.BEND * DEG + 0.5 * DEG) return 'tail–middle bent past ' + JOINT.BEND + '°';
+        const hl = body.headLim(b.delta >= 0 ? 1 : -1) + 0.5 * DEG;
+        return Math.abs(b.delta) > hl ? 'head bent past its limit' : null; } },
+      { name: 'on the ring', check: (a, b) => Math.abs(Math.hypot(b.M.x - C.x, b.M.y - C.y) - R) > 1e-6 ? 'the middle left the ring line' : null },
+      { name: 'fan', check: (a, b) => {
+        const w = Math.abs(wrap(b.psi - a.psi)) / Harness.DT / DEG;
+        return w > 90 ? 'body turned at ' + w.toFixed(0) + '°/s' : null; } },
+      { name: 'jump', check: (a, b) => {
+        const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
+        return d > 0.05 ? 'head moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } }
+    ],
+    pointer() { return false; },
+    draw(ctx, W, H) {
+      drawScene(ctx, W, H, body, null, []);
+      ctx.save();
+      ctx.strokeStyle = '#bbb'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.arc(X(C.x), Y(C.y), R * PX, 0, 2 * Math.PI); ctx.stroke();
+      ctx.setLineDash([]); ctx.strokeStyle = '#000'; ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
+      for (const o of obs) {
+        const ox = o.x + (o.jx || 0), oy = o.y + (o.jy || 0);
+        ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.arc(X(ox), Y(oy), o.r * PX, 0, 2 * Math.PI); ctx.stroke();
+        if (o.live) {   // shaking: a second, broken outline
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath(); ctx.arc(X(ox), Y(oy), o.r * PX + 4, 0, 2 * Math.PI); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.fillText(o.live ? 'alive' : 'stone', X(ox) - 12, Y(oy) - o.r * PX - 7);
+      }
+      ctx.restore();
+    }
+  };
+  return sim;
 }
 
 /* ---------------- drawing: lines on white ---------------- */
