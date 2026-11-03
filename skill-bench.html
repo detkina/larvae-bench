@@ -50,6 +50,12 @@ const BODY = {
   HEAD_D: 0.5,                   // head, 0.07 g
   ANCHOR: 0.75                   // the tail bears on the ground at its centre
 };
+/* Under a glass the soft tail is pressed flat to the middle's height, so the
+   larva bears the glass on tail and middle alike and the glass lies level.
+   The tail keeps its cross-section: lower, so wider. body.flat: 0 round, 1 flat. */
+const GLASS_REST = BODY.MID_D;                                  // cm: underside of a glass lying on the larva
+function tailHalfH(body) { return BODY.TAIL_D / 2 + ((GLASS_REST - BODY.TAIL_D) / 2) * (body.flat || 0); }
+function tailHalfW(body) { return BODY.TAIL_D / 2 + (BODY.TAIL_D * BODY.TAIL_D / GLASS_REST - BODY.TAIL_D) / 2 * (body.flat || 0); }
 
 /* ---------------- BODY: joints ----------------
    Both joints are the same and bend the same way in every direction.
@@ -903,7 +909,7 @@ const GLASS = {
 function curledParts(body) {
   const p = body.points();
   return [
-    { a: p.TM, b: p.tailEnd, r: BODY.TAIL_D / 2 },
+    { a: p.TM, b: p.tailEnd, r: tailHalfW(body) },
     { a: p.TM, b: p.MH, r: BODY.MID_D / 2 },
     { a: p.head, b: p.head, r: BODY.HEAD_D / 2 }
   ];
@@ -913,6 +919,7 @@ function curledParts(body) {
 function makeReferenceGlass() {
   const b = makeBody('left', { range: (a) => a, sign: () => 1, next: () => 0.5 });
   b.x = 0; b.y = 0; b.psi = 0; b.lam = 0;
+  b.flat = 1;                 // under a glass the tail is pressed flat, so a little wider
   b.beta = POSTURES.left.legs * GLASS.CURL * DEG;
   b.delta = b.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
   const parts = curledParts(b);
@@ -985,7 +992,7 @@ function longest(poly) { let L = 0; for (const a of poly) for (const b of poly) 
 // how much glass the reference piece leaves beyond a curled larva it covers
 function refCover() {
   const b = makeBody('left', { range: (a) => a, sign: () => 1, next: () => 0.5 });
-  b.x = REF_GLASS.larvaAt.x; b.y = REF_GLASS.larvaAt.y; b.psi = 0; b.lam = 0;
+  b.x = REF_GLASS.larvaAt.x; b.y = REF_GLASS.larvaAt.y; b.psi = 0; b.lam = 0; b.flat = 1;
   b.beta = POSTURES.left.legs * GLASS.CURL * DEG;
   b.delta = b.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
   return coverMargin(curledParts(b), REF_GLASS.local);
@@ -1000,6 +1007,7 @@ function createGlassBench(skill, rng, params) {
   body.beta = POSTURES.left.legs * GLASS.CURL * DEG;
   body.delta = body.clampHead(POSTURES.left.legs * GLASS.HEAD_CURL * DEG);
   const over = skill.where === 'over';
+  body.flat = over ? 1 : 0;              // under a glass the tail is pressed flat
   body.x = ARENA.W / 2 - 0.5; body.y = ARENA.H / 2 - 1.5;
   const span = longest(REF_GLASS.local);
   // on the floor: beside the larva, across its middle, so the side view shows
@@ -1160,7 +1168,7 @@ function createGlassBench(skill, rng, params) {
       ctx.lineWidth = 1.2; ctx.strokeStyle = '#000';
       ctx.fillStyle = '#000'; ctx.font = '10px Helvetica, Arial, sans-serif';
       if (over) {
-        ctx.strokeRect(ox + lo * K, fy - (BODY.TAIL_D + GLASS.THICK) * K, (hi - lo) * K, GLASS.THICK * K);
+        ctx.strokeRect(ox + lo * K, fy - (GLASS_REST + GLASS.THICK) * K, (hi - lo) * K, GLASS.THICK * K);
         ctx.fillText('glass held on its back, 7 mm', x0 + 6, y0 + 24);
       } else {
         ctx.setLineDash([4, 3]);
@@ -1270,6 +1278,7 @@ function createGlassTry(skill, rng, params) {
   return {
     body, target: null,
     step(dt) {
+      body.flat = Math.max(0, Math.min(1, (body.flat || 0) + (cur.on ? dt : -dt)));   // the tail flattens under a glass, rounds out without one
       t += dt;
       if (drag) { held = true; return; }
       held = false;
@@ -1348,7 +1357,7 @@ function createGlassTry(skill, rng, params) {
         let lo = Infinity, hi = -Infinity;
         for (const q of shape(cur)) { const s3 = (q.x - body.x) * u.x + (q.y - body.y) * u.y; lo = Math.min(lo, s3); hi = Math.max(hi, s3); }
         ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, 108); ctx.clip();
-        ctx.lineWidth = 1.2; ctx.strokeRect(ox + lo * K, fy - (BODY.TAIL_D + GLASS.THICK) * K, (hi - lo) * K, GLASS.THICK * K);
+        ctx.lineWidth = 1.2; ctx.strokeRect(ox + lo * K, fy - (GLASS_REST + GLASS.THICK) * K, (hi - lo) * K, GLASS.THICK * K);
       }
       ctx.restore();
     }
@@ -1359,21 +1368,27 @@ function createGlassTry(skill, rng, params) {
 /* ---------------- GETTING UNDER A GLASS ----------------
    As described: the larva crawls up to a glass lying on the floor. When its
    head meets the edge it stops, turns its middle (and head) legs-down, takes
-   the edge in its jaws and lifts it, smoothly; then the legs push the head and
-   body in under the glass. The glass rides on the head and back, its far edge
-   staying on the floor, and it never stands steeper than the body allows.
-   Under the glass the larva lies down on its side or rolls onto its back,
-   curls up, and the glass settles on it. It never puts the glass on its back
-   itself, and it does not walk about on its legs: they only push it in.
-   The glass is a rigid slab: tilted, it keeps its shape. */
+   the edge in its jaws and lifts it; then the legs push the head and body in
+   under the glass. Jaws and legs work in beats, so the glass rises in small
+   lifts with pauses between, never in a jump.
+   The glass is a rigid slab. While the far edge is on the floor it rests on
+   that edge and on the larva's head, so it stands at whatever slope those two
+   give. Once the head has gone in past the glass's middle, the glass tips over
+   the head onto the back and lies level on the middle: the far edge comes up
+   off the floor. Then the larva lies on its side or rolls onto its back and
+   curls up; the tail comes in under the glass and is pressed flat to the
+   middle's height, so the glass lies level on tail and middle.
+   It never puts the glass on its back itself, and it does not walk about on
+   its legs: they only push it in. */
 const UNDER = {
   START: 5,           // cm from the glass's middle at the start
   TWIST_S: 1.0,       // s to turn the front legs-down
-  JAW_LIFT: 0.6,      // cm the jaws raise the near edge, enough for the head to go under
-  JAW_S: 1.5,         // s to raise it
-  PUSH: 0.15,         // cm/s the legs push the body in
-  TILT_RATE: 20,      // deg/s at most: the glass rises and settles smoothly
-  MAX_TILT: 35,       // deg: it stops pushing in once the glass stands this steep
+  BEAT: 0.5,          // s: one beat of the jaws or the legs
+  WORK: 0.3,          // s of each beat spent working; the rest is a pause
+  JAW_BEATS: 4,       // beats of the jaws to lift the edge to the middle's height
+  PUSH: 0.15,         // cm/s the legs push the body in, on average over the beats
+  TILT_RATE: 20,      // deg/s at most: the glass never jumps
+  MAX_TILT: 35,       // deg: steeper than this the glass would slide off the head
   LIE_S: 1.0, ROLL_S: 2.0, CURL_S: 1.5
 };
 
@@ -1381,14 +1396,14 @@ const UNDER = {
 function makeSetter(body, g, shapeOf) {
   const NAMES = ['tail', 'middle', 'head'];
   const short = poly => {
-    let sum = 0, worst = 0, where = '';
+    let sum = 0, worst = 0, where = '', wq = null;
     curledParts(body).forEach((pt, i) => { for (let k = 0; k <= 12; k++) {
       const t = k / 12, q = { x: pt.a.x + (pt.b.x - pt.a.x) * t, y: pt.a.y + (pt.b.y - pt.a.y) * t };
       const d = polyEdgeDist(poly, q), m = polyContains(poly, q) ? d - pt.r : -d - pt.r;
       const lack = Math.max(0, GLASS.MARGIN - m);
-      sum += lack; if (lack > worst) { worst = lack; where = NAMES[i]; }
+      sum += lack; if (lack > worst) { worst = lack; where = NAMES[i]; wq = q; }
     } });
-    return { sum, where };
+    return { sum, where, wq };
   };
   const at = (x, y, rot) => shapeOf({ local: g.local, x, y, rot });
   const pivot = () => { const p = body.points(); return { x: (p.TM.x + p.MH.x) / 2, y: (p.TM.y + p.MH.y) / 2 }; };
@@ -1401,9 +1416,11 @@ function makeSetter(body, g, shapeOf) {
     const k = TRY.BEAT / TRY.PUSH, a = TRY.TURN * dt * k, d = TRY.SLIDE * dt * k;
     const now = short(shapeOf(g));
     if (now.sum <= 1e-9) return 'covered';
+    // the legs feel where the glass is short and pull it that way
+    const pull = (() => { if (!now.wq) return [0, 0]; const vx = now.wq.x - g.x, vy = now.wq.y - g.y, n = Math.hypot(vx, vy) || 1; return [vx / n * d, vy / n * d]; })();
     if (S.work === 'sweep') {
       let c = turned(g.x, g.y, g.rot, S.sweep * a), v = short(at(c.x, c.y, c.rot)).sum;
-      for (const [ex, ey] of [[d, 0], [-d, 0], [0, d], [0, -d]]) {
+      for (const [ex, ey] of [[d, 0], [-d, 0], [0, d], [0, -d], pull]) {
         const c2 = { x: c.x + ex, y: c.y + ey, rot: c.rot }, v2 = short(at(c2.x, c2.y, c2.rot)).sum;
         if (v2 < v) { v = v2; c = c2; }
       }
@@ -1414,7 +1431,8 @@ function makeSetter(body, g, shapeOf) {
       const tries = [turned(g.x, g.y, g.rot, a), turned(g.x, g.y, g.rot, -a),
         { x: g.x, y: g.y, rot: g.rot + a }, { x: g.x, y: g.y, rot: g.rot - a },
         { x: g.x + d, y: g.y, rot: g.rot }, { x: g.x - d, y: g.y, rot: g.rot },
-        { x: g.x, y: g.y + d, rot: g.rot }, { x: g.x, y: g.y - d, rot: g.rot }];
+        { x: g.x, y: g.y + d, rot: g.rot }, { x: g.x, y: g.y - d, rot: g.rot },
+        { x: g.x + pull[0], y: g.y + pull[1], rot: g.rot }];
       let best = null, bestS = now.sum;
       for (const c of tries) { const v = short(at(c.x, c.y, c.rot)).sum; if (v < bestS - 1e-9) { bestS = v; best = c; } }
       if (best) {
@@ -1450,10 +1468,28 @@ function createGlassUnder(skill, rng, params) {
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const f = poly[j].x * poly[i].y - poly[i].x * poly[j].y; A += f; ax += (poly[j].x + poly[i].x) * f; ay += (poly[j].y + poly[i].y) * f; }
     return { x: ax / (3 * A), y: ay / (3 * A) }; };
 
+  // The slab's pose: turned by `tilt` (near side up) about the line of the glass
+  // that lies on its support. pv.d: that line's distance from the far edge
+  // (measured in the glass), pv.a: where it is along the course, pv.z: its height.
+  // A point of the glass whose flat place is q is then at
+  //   along = pv.a + (pv.d − d)·cos tilt,  height = pv.z + (d − pv.d)·sin tilt,  d = far − along(q).
   let t = 0, state = 'approach', tilt = 0, k = 0, rhoFrom = 0, from = null, setter = null, course = null;
-  let level = 0;   // 0: the glass's far edge is on the floor; 1: it lies level on the larva
-  body.rhoTail = undefined;
+  let pv = null, beat = 0, liftGoal = 0;
+  body.rhoTail = undefined; body.flat = 0;
   const toward = (cur, want, rate) => cur + clamp(want - cur, -rate, rate);
+  const working = () => (beat % UNDER.BEAT) < UNDER.WORK;
+  const far = () => reach().hi;
+  const run = () => Math.max(0.05, far() - along(body.points().head));   // floor distance, head to the far edge
+  const restOnFarEdge = () => { pv = { d: 0, a: far(), z: 0 }; };
+  // where a point of the glass is, along the course and in height
+  const lift3 = q => { const d = (pv ? far() - along(q) : 0), c = Math.cos(tilt), sn = Math.sin(tilt);
+    if (!pv) return { a: along(q), z: 0 };
+    return { a: pv.a + (pv.d - d) * c, z: pv.z + (d - pv.d) * sn }; };
+  // seen from above: each point of the underside moved along the course
+  const seen = () => { const u = U(); return glassPoly().map(q => { const m = lift3(q).a - along(q); return { x: q.x + u.x * m, y: q.y + u.y * m }; }); };
+  const seenCentre = () => centroid(seen());
+  // the glass is level on the larva: its place on the floor is where it hangs now
+  const settle = () => { const u = U(), m = pv.a + pv.d - far(); g.x += u.x * m; g.y += u.y * m; pv = null; tilt = 0; };
 
   return {
     body, target: null,
@@ -1472,25 +1508,37 @@ function createGlassUnder(skill, rng, params) {
         k = Math.min(1, k + dt / UNDER.TWIST_S);
         body.rho = sideRho + (downRho - sideRho) * smooth(k);
         body.delta = toward(body.delta, 0, GAIT.HEAD_RATE * DEG * dt);
-        if (k >= 1) { state = 'jaws'; k = 0; }
+        if (k >= 1) { state = 'jaws'; beat = 0; liftGoal = 0; restOnFarEdge(); }
       } else if (state === 'jaws') {
-        // the jaws take the near edge and lift it; the far edge stays on the floor
-        const r = reach();
-        k = Math.min(1, k + dt / UNDER.JAW_S);
-        const want = Math.asin(Math.min(1, UNDER.JAW_LIFT * smooth(k) / Math.max(0.5, r.hi - r.lo)));
-        tilt = toward(tilt, want, tr);
-        if (k >= 1 && Math.abs(tilt - want) < 1e-3) state = 'push';
+        // the jaws take the near edge and lift it, a little each beat; the far edge stays on the floor
+        const before = Math.floor(beat / UNDER.BEAT); beat += dt;
+        if (Math.floor(beat / UNDER.BEAT) !== before || liftGoal === 0) liftGoal = Math.min(GLASS_REST, liftGoal + GLASS_REST / UNDER.JAW_BEATS);
+        pv.a = far();
+        if (working()) tilt = toward(tilt, Math.atan2(liftGoal, run()), tr);
+        if (liftGoal >= GLASS_REST && Math.abs(tilt - Math.atan2(GLASS_REST, run())) < 1e-4) { state = 'push'; beat = 0; }
       } else if (state === 'push') {
-        // the legs push the body in under it, straight on; the glass rides on the head and back
-        body.x += Math.cos(body.psi) * UNDER.PUSH * dt; body.y += Math.sin(body.psi) * UNDER.PUSH * dt;
-        body.travelled += UNDER.PUSH * dt;
+        // the legs push the body in under it, straight on, in beats;
+        // the glass rests on the far edge and on the head, so it rises as the head goes in
+        beat += dt;
+        if (working()) {
+          const v = UNDER.PUSH * UNDER.BEAT / UNDER.WORK * dt;
+          body.x += Math.cos(body.psi) * v; body.y += Math.sin(body.psi) * v; body.travelled += v;
+        }
         body.beta = toward(body.beta, 0, 30 * DEG * dt); body.lam = 0;
-        const r = reach(), p = body.points();
-        const run = Math.max(0.3, r.hi - Math.max(along(p.head), r.lo));
-        const want = Math.max(Math.asin(Math.min(1, UNDER.JAW_LIFT / Math.max(0.5, r.hi - r.lo))), Math.atan2(BODY.TAIL_D, run));
-        tilt = toward(tilt, Math.min(want, UNDER.MAX_TILT * DEG), tr);
-        const mid = { x: body.x, y: body.y };     // the middle of the whole body
-        if (polyContains(glassPoly(), mid) || want >= UNDER.MAX_TILT * DEG) { state = 'lie'; k = 0; rhoFrom = body.rho; }
+        pv.a = far();
+        tilt = toward(tilt, Math.min(Math.atan2(GLASS_REST, run()), UNDER.MAX_TILT * DEG), tr);
+        // past the glass's middle, the glass tips over the head onto the back
+        const past = along(body.points().head) >= along(centroid(glassPoly()));
+        if ((past || Math.atan2(GLASS_REST, run()) >= UNDER.MAX_TILT * DEG) && !working()) {
+          const ra = run(), c = Math.cos(tilt);
+          pv = { d: ra / c, a: far() - ra, z: (ra / c) * Math.sin(tilt) };   // it now turns about the line lying on the head
+          state = 'tip';
+        }
+      } else if (state === 'tip') {
+        // it settles level on the middle: the far edge comes off the floor
+        tilt = toward(tilt, 0, tr);
+        pv.z = toward(pv.z, GLASS_REST, 0.2 * dt);
+        if (tilt <= 0 && Math.abs(pv.z - GLASS_REST) < 1e-6) { settle(); state = 'lie'; k = 0; rhoFrom = body.rho; }
       } else if (state === 'lie') {
         // the front comes back onto its side
         k = Math.min(1, k + dt / UNDER.LIE_S);
@@ -1504,13 +1552,13 @@ function createGlassUnder(skill, rng, params) {
         body.rho = sideRho + (backRho - sideRho) * smooth(k);
         if (k >= 1) { state = 'curl'; k = 0; from = { beta: body.beta, delta: body.delta }; }
       } else if (state === 'curl') {
-        // curls up; the glass settles on it, level
+        // curls up under the level glass: the tail comes in under it and is pressed flat
         k = Math.min(1, k + dt / UNDER.CURL_S);
+        body.flat = smooth(k);
         const sgn = legs;
         body.beta = from.beta + (sgn * GLASS.CURL * DEG - from.beta) * smooth(k);
         body.delta = body.clampHead(from.delta + (sgn * GLASS.HEAD_CURL * DEG - from.delta) * smooth(k));
-        tilt = toward(tilt, 0, tr); level = smooth(k);
-        if (k >= 1 && tilt < 1e-4) { tilt = 0; level = 1; state = 'set'; setter = makeSetter(body, g, shapeOf); }
+        if (k >= 1) { state = 'set'; setter = makeSetter(body, g, shapeOf); }
       } else if (state === 'set') {
         const r = setter.step(dt);
         if (r === 'covered') state = 'covered'; else if (r === 'give-up') state = 'give-up';
@@ -1519,17 +1567,19 @@ function createGlassUnder(skill, rng, params) {
     status() {
       const lie = params.underLie === 'back' ? 'back' : 'side';
       const detail = 'glass tilted ' + Math.round(tilt / DEG) + '° · crawled ' + body.travelled.toFixed(1) + ' cm';
+      const pause = (state === 'jaws' || state === 'push') ? (working() ? ' · beat: working' : ' · beat: pause') : '';
       switch (state) {
         case 'approach': return { action: 'CRAWLING TO THE GLASS', reason: 'a glass lies ahead', detail };
         case 'stop': return { action: 'STOPPING', reason: 'my head has met the edge of the glass', detail };
         case 'twist': return { action: 'TURNING LEGS-DOWN', reason: 'turning my middle onto the legs to work the glass', detail };
-        case 'jaws': return { action: 'LIFTING THE EDGE', reason: 'the jaws take the edge and lift it', detail };
-        case 'push': return { action: 'PUSHING IN UNDER IT', reason: 'the legs push my head and body in under the glass; it rides on me, its far edge on the floor', detail };
-        case 'lie': return { action: 'LYING DOWN UNDER IT', reason: 'under the glass — turning the front back onto my side', detail };
-        case 'roll': return { action: 'ROLLING ONTO MY BACK', reason: 'under the glass', detail };
-        case 'curl': return { action: 'CURLING UP UNDER IT', reason: 'the glass settles on me', detail };
+        case 'jaws': return { action: 'LIFTING THE EDGE', reason: 'the jaws take the edge and lift it, beat by beat', detail: detail + pause };
+        case 'push': return { action: 'PUSHING IN UNDER IT', reason: 'the legs push my head and body in, beat by beat; the glass rests on my head and on its far edge', detail: detail + pause };
+        case 'tip': return { action: 'THE GLASS SETTLES ON ME', reason: 'my head is past its middle: it tips onto my back and lies level on my middle, the far edge comes up off the floor', detail };
+        case 'lie': return { action: 'LYING DOWN UNDER IT', reason: 'the glass lies level on my middle — turning the front back onto my side', detail };
+        case 'roll': return { action: 'ROLLING ONTO MY BACK', reason: 'under the level glass', detail };
+        case 'curl': return { action: 'CURLING UP UNDER IT', reason: 'the tail comes in under the glass and is pressed flat; the glass lies level on tail and middle', detail };
         case 'set': { const sh = setter.short(); return { action: 'SETTING THE GLASS', reason: 'the ' + sh.where + ' is short of glass — working it round with the legs', detail }; }
-        case 'covered': return { action: 'COVERED', reason: 'lying curled on my ' + lie + ' under the glass, covered all round', detail };
+        case 'covered': return { action: 'COVERED', reason: 'lying curled on my ' + lie + ' under the level glass, covered all round', detail };
       }
       return { action: 'GIVING UP', reason: 'this glass never covered me', detail };
     },
@@ -1540,10 +1590,11 @@ function createGlassUnder(skill, rng, params) {
       return null;
     },
     snapshot() {
-      const p = body.points();
+      const p = body.points(), c = seenCentre();
+      let lowest = 0; if (pv) { lowest = Infinity; for (const q of glassPoly()) lowest = Math.min(lowest, lift3(q).z); }
       return { x: body.x, y: body.y, psi: body.psi, beta: +body.beta.toFixed(5), lam: +body.lam.toFixed(5), delta: +body.delta.toFixed(5),
-        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, G: { x: g.x, y: g.y, rot: g.rot }, tilt, state,
-        rho: body.rho, rhoTail: body.rhoTail, course: (state === 'push' || state === 'jaws') ? course : null, skipChecks: false };
+        head: { x: +p.head.x.toFixed(4), y: +p.head.y.toFixed(4) }, G: { x: g.x, y: g.y, rot: g.rot }, seen: { x: c.x, y: c.y }, tilt, lowest, flat: body.flat, state,
+        rho: body.rho, rhoTail: body.rhoTail, course: (state === 'push' || state === 'jaws' || state === 'tip') ? course : null, skipChecks: false };
     },
     invariants: [
       { name: 'jump', check: (a, b) => { const d = Math.hypot(b.head.x - a.head.x, b.head.y - a.head.y);
@@ -1555,29 +1606,29 @@ function createGlassUnder(skill, rng, params) {
       { name: 'twist', check: (a, b) => (b.rhoTail !== undefined && Math.abs(b.rho - b.rhoTail) > JOINT.TWIST * DEG + 0.5 * DEG) ? 'front twisted past ' + JOINT.TWIST + '°' : null },
       { name: 'glass tilt', check: (a, b) => b.tilt > UNDER.MAX_TILT * DEG + 1e-6 ? 'glass stands at ' + Math.round(b.tilt / DEG) + '°' : null },
       { name: 'glass jerk', check: (a, b) => Math.abs(b.tilt - a.tilt) / Harness.DT > UNDER.TILT_RATE * DEG + 1e-6 ? 'glass tilted at ' + Math.round(Math.abs(b.tilt - a.tilt) / Harness.DT / DEG) + '°/s' : null },
-      { name: 'glass jump', check: (a, b) => { const d = Math.hypot(b.G.x - a.G.x, b.G.y - a.G.y);
+      { name: 'glass jump', check: (a, b) => { const d = Math.hypot(b.seen.x - a.seen.x, b.seen.y - a.seen.y);
         return d > 0.1 ? 'glass moved ' + (d * 10).toFixed(1) + ' mm in one tick' : null; } },
+      { name: 'glass in the floor', check: (a, b) => b.lowest < -1e-6 ? 'a corner of the glass is below the floor' : null },
+      { name: 'glass level on the larva', check: (a, b) => (b.flat >= 1 && b.tilt > 1e-6) ? 'the glass is not level on the flattened larva' : null },
       { name: 'course', check: (a, b) => (b.course !== null && Math.abs(wrap(b.psi - b.course)) > 1e-6) ? 'turned off course while getting under' : null }
     ],
     pointer() { return false; },
     draw(ctx, W, H) {
       drawScene(ctx, W, H, body, null, []);
       ctx.save();
-      // top view of the rigid slab. Tilted about its far bottom edge, each point
-      // comes toward that edge by (1 − cos t) of its distance; the top face sits
-      // T·sin t further toward the far side. Seen from above: the top face and,
-      // at the lifted near side, the edge face as a band.
-      const poly = glassPoly(), u = U(), rr = reach(), ct = Math.cos(tilt), stT = Math.sin(tilt) * GLASS.THICK;
-      const bottom = poly.map(q => { const d = rr.hi - along(q), m = d * (1 - ct); return { x: q.x + u.x * m, y: q.y + u.y * m }; });
+      // top view of the rigid slab: the underside where it is now, the top face
+      // T·sin(tilt) further toward the high side's opposite, and between them, at
+      // the lifted side, the edge face seen from above as a band.
+      const poly = glassPoly(), u = U(), stT = Math.sin(tilt) * GLASS.THICK;
+      const bottom = seen();
       const top = bottom.map(q => ({ x: q.x + u.x * stT, y: q.y + u.y * stT }));
       const path = pts => { ctx.beginPath(); pts.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath(); };
       ctx.strokeStyle = '#000';
       if (tilt > 1e-4) {
         const out = convexHull(bottom.concat(top));     // the slab's outline from above
-        // where it lay before it was lifted, for comparison
+        // where it lay on the floor, for comparison
         path(poly); ctx.setLineDash([2, 3]); ctx.lineWidth = 0.8; ctx.strokeStyle = '#999'; ctx.stroke(); ctx.setLineDash([]);
         ctx.strokeStyle = '#000';
-        // the lifted edge face: outline minus top face
         ctx.beginPath();
         out.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
         top.forEach((q, i) => i ? ctx.lineTo(X(q.x), Y(q.y)) : ctx.moveTo(X(q.x), Y(q.y))); ctx.closePath();
@@ -1585,21 +1636,22 @@ function createGlassUnder(skill, rng, params) {
         path(top); ctx.fillStyle = 'rgba(0,0,0,0.05)'; ctx.fill(); ctx.lineWidth = 1.4; ctx.stroke();
         path(out); ctx.lineWidth = 1.4; ctx.stroke();
       } else {
-        path(poly); ctx.fillStyle = 'rgba(0,0,0,0.05)'; ctx.fill();
+        path(bottom); ctx.fillStyle = 'rgba(0,0,0,0.05)'; ctx.fill();
         ctx.lineWidth = state === 'approach' ? 1 : 1.4; ctx.stroke();
       }
-      // side view: the slab keeps its shape. Tilted, it is turned about its far
-      // bottom edge on the floor; settled, it lies level on the curled larva.
+      // side view: the slab keeps its shape; drawn from its far and near underside edges
       const bw = 230, x0 = W - bw - 10, y0 = 10, K = 36, fy = y0 + 110 - 14, ox = x0 + 130;
       const r = reach(), L = r.hi - r.lo, T = GLASS.THICK;
       ctx.beginPath(); ctx.rect(x0 + 1, y0 + 1, bw - 2, 108); ctx.clip();
       ctx.lineWidth = 1.2; ctx.strokeStyle = '#000';
       const P = (s3, z) => [ox + s3 * K, fy - z * K];
-      const zb = BODY.TAIL_D * level;                     // the far bottom edge: on the floor, then up on the larva
       const c = Math.cos(tilt), sn = Math.sin(tilt);
-      const far = [r.hi, zb], near = [r.hi - L * c, zb + L * sn];
+      const level = state === 'lie' || state === 'roll' || state === 'curl' || state === 'set' || state === 'covered' || state === 'give-up';
+      let farE, nearE;
+      if (!pv) { const z0 = level ? GLASS_REST : 0; farE = [r.hi, z0]; nearE = [r.lo, z0]; }
+      else { farE = [pv.a + pv.d * c, pv.z - pv.d * sn]; nearE = [pv.a + (pv.d - L) * c, pv.z + (L - pv.d) * sn]; }
       const up = [sn * T, c * T];                         // the slab's own thickness, square to its faces
-      const q = [far, near, [near[0] + up[0], near[1] + up[1]], [far[0] + up[0], far[1] + up[1]]].map(v => P(v[0], v[1]));
+      const q = [farE, nearE, [nearE[0] + up[0], nearE[1] + up[1]], [farE[0] + up[0], farE[1] + up[1]]].map(v => P(v[0], v[1]));
       ctx.beginPath(); q.forEach((v, i) => i ? ctx.lineTo(v[0], v[1]) : ctx.moveTo(v[0], v[1])); ctx.closePath(); ctx.stroke();
       ctx.restore();
     }
@@ -1656,7 +1708,7 @@ function drawScene(ctx, W, H, body, target, trail) {
 
   const p = body.points();
   ctx.strokeStyle = '#000'; ctx.lineWidth = 1.3;
-  capsule(ctx, p.TM, p.tailEnd, BODY.TAIL_D / 2, body.lam > 1 * DEG);   // dashed = lifted off the floor
+  capsule(ctx, p.TM, p.tailEnd, tailHalfW(body), body.lam > 1 * DEG);   // dashed = lifted off the floor
   capsule(ctx, p.TM, p.MH, BODY.MID_D / 2, false);
   ctx.beginPath(); ctx.arc(X(p.head.x), Y(p.head.y), BODY.HEAD_D / 2 * PX, 0, 2 * Math.PI); ctx.stroke();
 
@@ -1699,10 +1751,10 @@ function drawSideView(ctx, W, H, body) {
     ctx.closePath(); ctx.setLineDash(dashed ? [3, 3] : []); ctx.stroke(); ctx.setLineDash([]);
   };
   ctx.lineWidth = 1.2;
-  const zT = BODY.TAIL_D / 2;
+  const zT = tailHalfH(body);
   seg(0, BODY.MID_D / 2, BODY.MID_LEN, BODY.MID_D / 2, BODY.MID_D / 2, false);
   const tx = -BODY.TAIL_LEN * Math.cos(body.lam) * Math.cos(body.beta), tz = zT + BODY.TAIL_LEN * Math.sin(body.lam);
-  seg(0, zT, tx, tz, BODY.TAIL_D / 2, body.lam > 1 * DEG);
+  seg(0, zT, tx, tz, zT, body.lam > 1 * DEG);
   // the head hangs off the front of the middle, tilted up: it does not touch the ground
   const hr = BODY.HEAD_D / 2;
   const hx = BODY.MID_LEN + hr * Math.cos(body.headLift) * Math.cos(body.delta);
