@@ -77,7 +77,7 @@
     W.nameOf = k => W.names.get(k) || ('body ' + (k & 0x7fffff));
     // reused per step, so stepping allocates nothing in the solver's memory
     const TMP = { r: new J.RVec3(), v: new J.Vec3(), q: J.Quat.prototype.sIdentity(), r2: new J.Vec3() };
-    W.tune = Object.assign({ springHz: 90, pushHz: 15, substeps: 8, segContact: 0.3, flatS: 0.6 }, opts.tune || {});
+    W.tune = Object.assign({ springHz: 90, pushHz: 40, tailHz: 90, dose: 0.1, tailDose: 0.15, substeps: 8, segContact: 0.3, flatS: 0.6, roundS: 3 }, opts.tune || {});
     W.skinTouch = new Map();     // other body key → contacts with the larva's soft body this step
     // rigid contacts this step (the head, glasses, stones, floor): pairs of keys, depth, normal
     W.contacts = [];
@@ -121,12 +121,36 @@
     }
 
     /* A glass: a slab of the given outline (cm, in its own frame) and thickness. */
+    // Jolt hands a face to the contact clipper as at most 32 corners: a face with more
+    // loses some, and a corner it loses can sink into the floor unseen. So an outline
+    // keeps at most MAX_CORNERS: the corners that matter least (the flattest bends) go first.
+    const MAX_CORNERS = 30, BEAD = 0.004;
+    const fewerCorners = local => {
+      const q = local.slice();
+      const area = i => { const a = q[(i + q.length - 1) % q.length], b = q[i], c = q[(i + 1) % q.length];
+        return Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)); };
+      while (q.length > MAX_CORNERS) { let k = 0, best = Infinity; for (let i = 0; i < q.length; i++) { const A = area(i); if (A < best) { best = A; k = i; } } q.splice(k, 1); }
+      return q;
+    };
     W.addGlass = (local, thick, x, y, rot, z = 0) => {
+      local = fewerCorners(local);
       const hs = new J.ConvexHullShapeSettings();
       for (const q of local) { hs.mPoints.push_back(v3(q.x, 0, q.y)); hs.mPoints.push_back(v3(q.x, thick, q.y)); }
       hs.mMaxConvexRadius = 0.01; hs.mHullTolerance = 0.0005;
       hs.mDensity = GLASS_DENSITY;
-      const res = hs.Create(); if (res.HasError()) throw new Error('glass hull: ' + res.GetError().c_str());
+      // and a tiny bead at every corner: a corner resting on something is then always
+      // a contact the solver sees, whatever face the clipper chose
+      const cs0 = new J.StaticCompoundShapeSettings();
+      cs0.AddShape(v3(0, 0, 0), J.Quat.prototype.sIdentity(), hs, 0);
+      const cx = local.reduce((a, q) => a + q.x, 0) / local.length, cy = local.reduce((a, q) => a + q.y, 0) / local.length;
+      for (const q of local) {
+        const dx = cx - q.x, dy = cy - q.y, d = Math.hypot(dx, dy) || 1, ix = q.x + dx / d * BEAD, iy = q.y + dy / d * BEAD;
+        for (const h of [BEAD, thick - BEAD]) {
+          const ss = new J.SphereShapeSettings(BEAD); ss.mDensity = GLASS_DENSITY;
+          cs0.AddShape(v3(ix, h, iy), J.Quat.prototype.sIdentity(), ss, 0);
+        }
+      }
+      const res = cs0.Create(); if (res.HasError()) throw new Error('glass hull: ' + res.GetError().c_str());
       const shape = res.Get();
       const q = J.Quat.prototype.sRotation(v3(0, 1, 0), -rot);   // bench rot is counter-clockwise seen from above
       const cs = new J.BodyCreationSettings(shape, r3(x, z, y), q, J.EMotionType_Dynamic, LAYER_MOVING);
@@ -162,14 +186,15 @@
       // a sausage of the given length, its cross-section an ellipse h high and w wide
       const sausage = (len, h, w) => {
         const hs = new J.ConvexHullShapeSettings();
-        const ring = (y, k) => { for (let i = 0; i < 16; i++) { const a = i / 16 * 2 * Math.PI; hs.mPoints.push_back(v3(Math.cos(a) * w * k, y, Math.sin(a) * h * k)); } };
+        // in the segment's frame x is up and down, z sideways: h is its height, w its width
+        const ring = (y, k) => { for (let i = 0; i < 16; i++) { const a = i / 16 * 2 * Math.PI; hs.mPoints.push_back(v3(Math.cos(a) * h * k, y, Math.sin(a) * w * k)); } };
         ring(-len / 2, 1); ring(len / 2, 1);
         for (const c of [30, 55, 75]) { const a = c * Math.PI / 180, r = Math.min(h, w); ring(-len / 2 - r * Math.sin(a), Math.cos(a)); ring(len / 2 + r * Math.sin(a), Math.cos(a)); }
         hs.mMaxConvexRadius = 0.01; hs.mHullTolerance = 0.0005;
         return hs.Create().Get();
       };
       // the soft tail, pressed from above, flattens: lower and wider, the same cross-section
-      const FLAT = [0, 0.25, 0.5, 0.75, 1];
+      const FLAT = [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1];   // small steps: each change of shape is a small one
       const tailH = f => TAIL_D / 2 + (MID_D / 2 - TAIL_D / 2) * f, tailW = f => (TAIL_D / 2) * (TAIL_D / 2) / tailH(f);
       // segments: three on the tail, two on the middle; from the tail's end forward
       const cuts = [0, TAIL_LEN / 3, 2 * TAIL_LEN / 3, TAIL_LEN, TAIL_LEN + MID_LEN / 2, L];
@@ -198,7 +223,7 @@
           // about a level line), y along the body, z sideways. It bears weight stiffly; pushing
           // along or sideways, and twisting, its muscles give way sooner
           const firm = ax === J.SixDOFConstraintSettings_EAxis_TranslationX;
-          const sp = c6.get_mLimitsSpringSettings(ax); sp.mFrequency = firm ? W.tune.springHz : W.tune.pushHz; sp.mDamping = 1;
+          const sp = c6.get_mLimitsSpringSettings(ax); sp.mFrequency = firm ? W.tune.springHz : (isTail ? W.tune.tailHz : W.tune.pushHz); sp.mDamping = 1;
         }
         const con = c6.Create(anchor, body); system.AddConstraint(con); J.destroy(c6);
         const seg = { body, anchor, s0, s1, r, len, isTail, shapes, flat: 0, key: body.GetID().GetIndexAndSequenceNumber(), placed: false };
@@ -239,7 +264,14 @@
         const q = quatYto(d[0], d[1], d[2]);
         TMP.r.Set(pm[0], pm[1], pm[2]);
         const Q = new J.Quat(q[0], q[1], q[2], q[3]);
-        if (sg.placed) bi.MoveKinematic(sg.anchor.GetID(), TMP.r, Q, dt);
+        if (sg.placed) {
+          // she is strong but doses her force: the skeleton never runs further ahead of the
+          // body than 'dose', so against something that will not give she presses only so hard
+          const bp = sg.body.GetPosition(), ex = pm[0] - bp.GetX(), ey = pm[1] - bp.GetY(), ez = pm[2] - bp.GetZ(), e = Math.hypot(ex, ey, ez);
+          const dose = sg.isTail ? W.tune.tailDose : W.tune.dose;
+          if (e > dose) { const k = dose / e; TMP.r.Set(bp.GetX() + ex * k, bp.GetY() + ey * k, bp.GetZ() + ez * k); }
+          bi.MoveKinematic(sg.anchor.GetID(), TMP.r, Q, dt);
+        }
         else {
           bi.SetPositionAndRotation(sg.anchor.GetID(), TMP.r, Q, J.EActivation_Activate);
           bi.SetPositionAndRotation(sg.body.GetID(), TMP.r, Q, J.EActivation_Activate);
@@ -254,16 +286,22 @@
     };
 
     // the soft body's surface as points (bench coordinates): rings round each segment
+    // the soft body's surface as points (bench coordinates): rings round each segment and
+    // its rounded ends, at the segment's true height and width (a pressed tail is wider)
     W.skinPoints = larva => {
       const out = [];
       for (const sg of larva.segs) {
         const p = sg.body.GetPosition(), r = sg.body.GetRotation(), qx = r.GetX(), qy = r.GetY(), qz = r.GetZ(), qw = r.GetW();
-        const n = 4;
-        for (let i = 0; i <= n; i++) {
-          const y = -sg.len / 2 + sg.len * i / n;
-          for (let k = 0; k < 10; k++) {
-            const t = k / 10 * 2 * Math.PI, w = qrot(qx, qy, qz, qw, Math.cos(t) * sg.r, y, Math.sin(t) * sg.r);
-            out.push({ x: w[0] + p.GetX(), y: w[2] + p.GetZ(), z: w[1] + p.GetY(), s: sg.s0 + (sg.s1 - sg.s0) * i / n, seg: sg.key });
+        const h = sg.isTail ? larva.tailH(larva.FLAT[sg.flat]) : sg.r, w = sg.isTail ? larva.tailW(larva.FLAT[sg.flat]) : sg.r, cap = Math.min(h, w);
+        const rings = [];
+        for (let i = 0; i <= 4; i++) rings.push({ y: -sg.len / 2 + sg.len * i / 4, k: 1 });
+        for (const c of [35, 65, 90]) { const a = c * Math.PI / 180; rings.push({ y: -sg.len / 2 - cap * Math.sin(a), k: Math.cos(a) }, { y: sg.len / 2 + cap * Math.sin(a), k: Math.cos(a) }); }
+        for (const rg of rings) {
+          const n = rg.k < 0.05 ? 1 : 12;
+          for (let k = 0; k < n; k++) {
+            const t = k / n * 2 * Math.PI, q = qrot(qx, qy, qz, qw, Math.cos(t) * h * rg.k, rg.y, Math.sin(t) * w * rg.k);
+            const sAt = sg.s0 + (sg.s1 - sg.s0) * Math.max(0, Math.min(1, (rg.y + sg.len / 2) / sg.len));
+            out.push({ x: q[0] + p.GetX(), y: q[2] + p.GetZ(), z: q[1] + p.GetY(), s: sAt, seg: sg.key });
           }
         }
       }
@@ -456,7 +494,8 @@
       // step; with nothing on it, it rounds out again
       for (const lv of W.larvae) for (const sg of lv.segs) if (sg.isTail) {
         const pressed = W.contacts.some(c => (c.a === sg.key || c.b === sg.key) && !W.isFloor(c.a === sg.key ? c.b : c.a) && !lv.keys.has(c.a === sg.key ? c.b : c.a) && Math.abs(c.n.z) > 0.7 && c.at.z > (sg.body.GetPosition().GetY()));
-        sg.press = Math.max(0, Math.min(1, (sg.press || 0) + (pressed ? dt : -dt) / W.tune.flatS));
+        // it flattens while pressed and rounds out again slowly, so a glass that rocks on it does not pump it
+        sg.press = Math.max(0, Math.min(1, (sg.press || 0) + (pressed ? dt / W.tune.flatS : -dt / W.tune.roundS)));
         const want = Math.round(sg.press * (lv.FLAT.length - 1));
         if (want !== sg.flat) { sg.flat = want; bi.SetShape(sg.body.GetID(), sg.shapes[want], false, J.EActivation_Activate); }
       }

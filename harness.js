@@ -181,6 +181,7 @@
   .hz-state{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;border-top:1px solid #000;
     border-bottom:1px solid #000;padding:6px 0;margin:6px 0;min-height:3.2em}
   .hz-state .hz-action{font-weight:bold}
+  .hz-state .hz-time{display:inline-block;min-width:5.5em;font-weight:bold}
   .hz-alert{color:#c00;-webkit-text-fill-color:#c00}
   .hz-mute{color:#666;-webkit-text-fill-color:#666}
   .hz-canvas{display:block;width:100%;height:auto;border:0;touch-action:none;
@@ -324,7 +325,7 @@
         return;
       }
       const s = run.sim.status();
-      let html = '<span class="hz-action">' + esc(s.action) + '</span> — ' + esc(s.reason);
+      let html = '<span class="hz-time">' + run.time().toFixed(1) + ' s</span> <span class="hz-action">' + esc(s.action) + '</span> — ' + esc(s.reason);
       if (s.detail) html += '<br><span class="hz-mute">' + esc(s.detail) + '</span>';
       if (alertMsg) html += '<br><span class="hz-alert">' + esc(alertMsg) + '</span>';
       else if (run.finished) html += '<br><b>' + esc((run.finished.ok ? 'DONE — ' : 'FAILED — ') + run.finished.why) + '</b>';
